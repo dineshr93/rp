@@ -668,6 +668,12 @@ fn upsert_pointer(md: &Path, block: &str) -> &'static str {
             None => format!("{}\n\n{block}\n", cur.trim_end()),
         },
     };
+    // Keep exactly one blank line after the end marker, whichever branch ran.
+    // Written as a replace so a re-install never stacks a second blank line.
+    let new = new.replace(
+        &format!("{POINTER_END}\n#"),
+        &format!("{POINTER_END}\n\n#"),
+    );
     if new == cur {
         return "unchanged";
     }

@@ -1,0 +1,97 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      # The integration suite stubs git/gh/graphicle/node in a temp PATH and points
+      # every rp path at a temp dir, so CI needs no credentials and no network.
+      - run: cargo test --release
+
+  smoke:
+    name: install / uninstall smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: install into a throwaway environment
+        run: |
+          set -eu
+          T=$(mktemp -d)
+          export RP_SRC=$PWD
+          export RP_SKILLS=$T/skills
+          export RP_AGENT_MD=$T/AGENTS.md
+          export RP_BIN=$T/rp
+          export RP_LEDGER=$T/ledger.tsv
+          export RP_CACHE=$T/cache
+          export GRAPHICLE_DATA_DIR=$T/gstore
+          export RP_FREE_FLOOR_GB=0
+          printf '# my agent notes\n\nkeep this line\n\n## Shell\n\ntable stuff\n' > "$RP_AGENT_MD"
+
+          ./target/release/rp install
+          test -f "$RP_SKILLS/SKILL.md"
+          grep -q 'repo-tiers:start' "$RP_AGENT_MD"
+          grep -q 'keep this line' "$RP_AGENT_MD"
+
+          # second run must be a no-op
+          ./target/release/rp install > "$T/i2"
+          if grep -qE 'installed|created|inserted|FAILED' "$T/i2"; then
+            echo "install is not idempotent:"; cat "$T/i2"; exit 1
+          fi
+
+          # doctor must emit valid JSON even with no graphicle/gh on the box
+          ./target/release/rp --json doctor | python3 -m json.tool > /dev/null
+
+          ./target/release/rp uninstall
+          grep -q 'keep this line' "$RP_AGENT_MD"
+          if grep -q 'repo-tiers' "$RP_AGENT_MD"; then
+            echo "pointer block survived uninstall"; exit 1
+          fi
+          test ! -d "$RP_SKILLS"
+          echo "smoke ok"
+
+  release-artifact:
+    name: release binary
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, test, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rp-linux-x86_64
+          path: target/release/rp

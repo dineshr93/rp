@@ -10,6 +10,9 @@
 //!
 //! No crates on purpose. Everything here is a subprocess plus arithmetic.
 
+#![deny(unsafe_code)]
+#![deny(clippy::all)]
+
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::env;
@@ -17,19 +20,89 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-const USAGE: &str = "usage: rp [state|warm|docs|top [N]|gc|get|clone|cache|evict|install|doctor] [path]\n\
-  state  (default) report the tier of a local repo and record the visit\n\
-  get    owner/repo: answer remotely, never clone\n\
-  clone  owner/repo [subpath]: budget-checked shallow / sparse clone\n\
-  warm   graphicle code graph (callers, impact, why)\n\
-  docs   context-mode text index\n\
-  top    most-visited repos = warm candidates\n\
-  cache  clone cache: size, last touch, dirty flag\n\
-  evict  LRU eviction; never removes a clone with uncommitted work\n\
-  gc     graphicle store report and the reclaim path\n\
-  install  bootstrap this box: skill files + AGENTS.md pointer + binary (idempotent)\n\
-  doctor   check toolchain, budgets and install; exits 1 on a hard miss";
+/// Failed I/O that must not pass as success. Every `warn_io` bumps this; `main`
+/// exits 1 if it is non-zero, so a caller can tell "worked" from "printed anyway".
+static ERRORS: AtomicUsize = AtomicUsize::new(0);
+static JSON: AtomicBool = AtomicBool::new(false);
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Progress chatter: silenced by --quiet. Errors go to stderr and always print.
+fn say(s: String) {
+    if !QUIET.load(Ordering::Relaxed) {
+        println!("{s}");
+    }
+}
+
+fn json_on() -> bool {
+    JSON.load(Ordering::Relaxed)
+}
+
+fn warn_io(what: &str, e: &std::io::Error) {
+    ERRORS.fetch_add(1, Ordering::Relaxed);
+    eprintln!("rp: {what}: {e}");
+}
+
+/// Minimal JSON string escaping — no serde, no crate.
+fn jesc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn jstr(s: &str) -> String {
+    format!("\"{}\"", jesc(s))
+}
+
+/// Array of raw strings (each quoted here).
+fn jarr(items: &[String]) -> String {
+    format!(
+        "[{}]",
+        items.iter().map(|s| jstr(s)).collect::<Vec<_>>().join(",")
+    )
+}
+
+/// Array of already-built JSON values — joined verbatim, never re-escaped.
+fn jarr_raw(items: &[String]) -> String {
+    format!("[{}]", items.join(","))
+}
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const USAGE: &str = "usage: rp [flags] [command] [args]\n\
+\n\
+commands:\n\
+  state    (default) tier of a local repo; records the visit\n\
+  get      owner/repo: answer remotely, never clone\n\
+  clone    owner/repo [subpath]: budget-checked shallow / sparse clone\n\
+  warm     graphicle code graph (callers, impact, why)\n\
+  docs     context-mode text index\n\
+  top      most-visited repos = warm candidates [N]\n\
+  cache    clone cache: size, last touch, dirty flag\n\
+  evict    LRU eviction; never removes a clone with uncommitted work\n\
+  gc       graphicle store report and the reclaim path\n\
+  install  bootstrap this box: binary + skill + AGENTS.md pointer (idempotent)\n\
+  uninstall  undo install: pointer block + skill dir (--all also removes the binary)\n\
+  doctor   toolchain, budget and install health\n\
+\n\
+flags:\n\
+  -j, --json   machine-readable output (state, get, top, cache, doctor)\n\
+  -q, --quiet  suppress progress chatter; errors still print\n\
+  -V, --version  print version\n\
+  -h, --help   this text\n\
+\n\
+exit codes: 0 ok · 1 failed or degraded (see stderr) · 2 bad usage or bad input";
 
 struct Cfg {
     ledger: PathBuf,
@@ -50,7 +123,10 @@ fn svar(key: &str, default: &str) -> String {
 }
 
 fn uvar(key: &str, default: u64) -> u64 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 impl Cfg {
@@ -79,21 +155,23 @@ impl Cfg {
             floor_gb: uvar("RP_FREE_FLOOR_GB", 100),
         };
         if let Some(p) = c.ledger.parent() {
-            let _ = fs::create_dir_all(p);
+            if let Err(e) = fs::create_dir_all(p) {
+                warn_io("cannot create ledger dir", &e);
+            }
         }
-        let _ = fs::create_dir_all(&c.markdir);
-        let _ = fs::create_dir_all(&c.cache);
+        if let Err(e) = fs::create_dir_all(&c.markdir) {
+            warn_io("cannot create index-mark dir", &e);
+        }
+        if let Err(e) = fs::create_dir_all(&c.cache) {
+            warn_io("cannot create clone cache", &e);
+        }
         c
     }
 }
 
 /// Run a program, return (exit code, stdout+stderr). Never panics on spawn failure.
 fn run(prog: &str, args: &[&str]) -> (i32, String) {
-    match Command::new(prog)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-    {
+    match Command::new(prog).args(args).stdin(Stdio::null()).output() {
         Ok(o) => {
             let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
             s.push_str(&String::from_utf8_lossy(&o.stderr));
@@ -169,12 +247,17 @@ fn read_ledger(c: &Cfg) -> Ledger {
 }
 
 fn record(c: &Cfg, path: &str) {
-    if let Ok(mut f) = fs::OpenOptions::new()
+    match fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&c.ledger)
     {
-        let _ = writeln!(f, "{}\t{path}", now());
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{}\t{path}", now()) {
+                warn_io("ledger write", &e);
+            }
+        }
+        Err(e) => warn_io("ledger open", &e),
     }
 }
 
@@ -183,7 +266,11 @@ fn visits(l: &Ledger, p: &str) -> usize {
 }
 
 fn last_touch(l: &Ledger, p: &str) -> i64 {
-    l.iter().filter(|(_, q)| q == p).map(|(t, _)| *t).max().unwrap_or(0)
+    l.iter()
+        .filter(|(_, q)| q == p)
+        .map(|(t, _)| *t)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Is this path a registered graphicle project?
@@ -225,6 +312,32 @@ fn norm_slug(raw: &str) -> String {
     r.trim_matches('/').to_string()
 }
 
+fn valid_name(p: &str) -> bool {
+    !p.is_empty()
+        && p != "."
+        && p != ".."
+        && !p.starts_with(".git")
+        && p.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Exactly `owner/repo`. Rejects traversal, empty segments and forge-invalid names,
+/// so a typo cannot turn `rp clone` into a write outside the cache.
+fn valid_slug(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('/').collect();
+    parts.len() == 2 && parts.iter().all(|p| valid_name(p))
+}
+
+/// Repo-relative sparse path: no absolute paths, no `..`, no NUL.
+fn valid_subpath(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with('/') && !s.split('/').any(|p| p == "..") && !s.contains('\0')
+}
+
+fn die_input(msg: &str) -> ! {
+    eprintln!("rp: {msg}");
+    exit(2)
+}
+
 /// Stable short id for a repo root: FNV-1a, no hashing crate.
 fn mark_path(c: &Cfg, root: &str) -> PathBuf {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -236,10 +349,14 @@ fn mark_path(c: &Cfg, root: &str) -> PathBuf {
 }
 
 fn count_files(root: &str) -> usize {
-    let (_, o) = run(
-        "find",
-        &[root, "-type", "f", "-not", "-path", "*/.git/*"],
-    );
+    let (rc, o) = run("find", &[root, "-type", "f", "-not", "-path", "*/.git/*"]);
+    if rc != 0 {
+        warn_io(
+            "file count (find)",
+            &std::io::Error::other(format!("find exited {rc}")),
+        );
+        return 0;
+    }
     o.lines().filter(|l| !l.is_empty()).count()
 }
 
@@ -252,52 +369,100 @@ fn abs(p: &str) -> String {
 // ---------------------------------------------------------------- commands ---
 
 fn cmd_state(c: &Cfg, path: &str) {
+    if !Path::new(path).exists() {
+        die_input(&format!("no such path: {path}"));
+    }
     let root = repo_root(&abs(path));
     let name = base(&root);
     record(c, &root);
     let l = read_ledger(c);
     let v = visits(&l, &root);
 
-    if registered(&root) {
-        println!("repo: {name}  visits={v}  tier: T2 graph ready");
-        println!("  use: recall_project / query_graph (MCP) — callers, impact, why");
+    let (tier, label, note, next): (&str, &str, &str, Vec<String>) = if registered(&root) {
+        (
+            "T2",
+            "graph ready",
+            "",
+            vec!["recall_project / query_graph (MCP) — callers, impact, why".into()],
+        )
     } else if mark_path(c, &root).exists() {
-        println!("repo: {name}  visits={v}  tier: T1 text index ready");
-        println!("  use: ctx_search(queries:[...]) — prose/log/code text, no graph");
+        (
+            "T1",
+            "text index ready",
+            "",
+            vec!["ctx_search(queries:[...]) — prose/log/code text, no graph".into()],
+        )
     } else if v >= 2 {
-        println!("repo: {name}  visits={v}  tier: T0 cold — repeat visitor, indexing now pays");
-        println!("  now: grep -rn 'PATTERN' .            (0.02s, free)");
-        println!("  then: rp warm .                     (graphicle graph, background)");
-        println!("  docs only: rp docs .                (context-mode text index)");
+        (
+            "T0",
+            "cold — repeat visitor, indexing now pays",
+            "",
+            vec![
+                "grep -rn 'PATTERN' .            (0.02s, free)".into(),
+                "rp warm .                       (graphicle graph, background)".into(),
+                "rp docs .                       (context-mode text index)".into(),
+            ],
+        )
     } else {
-        println!("repo: {name}  visits={v}  tier: T0 cold — DO NOT INDEX");
-        println!("  indexing costs ~1-10s and 9-380 MB; a one-touch repo never earns it back");
-        println!("  use: grep -rn 'PATTERN' .   |   rtk read FILE --max-lines 40");
-    }
+        (
+            "T0",
+            "cold — DO NOT INDEX",
+            "indexing costs ~1-10s and 9-380 MB; a one-touch repo never earns it back",
+            vec!["grep -rn 'PATTERN' .   |   rtk read FILE --max-lines 40".into()],
+        )
+    };
 
     let mb = du_mb(&c.gstore);
-    let over = if mb > c.budget_mb {
-        " — OVER: run rp gc"
-    } else {
-        ""
-    };
-    println!("  store: {mb} MB / {} MB budget{over}", c.budget_mb);
+    let over = mb > c.budget_mb;
+
+    if json_on() {
+        println!(
+            "{{\"repo\":{},\"path\":{},\"visits\":{},\"tier\":{},\"tier_label\":{},\"note\":{},\"next\":{},\"store_mb\":{},\"store_budget_mb\":{},\"over_budget\":{}}}",
+            jstr(&name),
+            jstr(&root),
+            v,
+            jstr(tier),
+            jstr(label),
+            jstr(note),
+            jarr(&next),
+            mb,
+            c.budget_mb,
+            over
+        );
+        return;
+    }
+
+    println!("repo: {name}  visits={v}  tier: {tier} {label}");
+    for n in &next {
+        println!("  {n}");
+    }
+    if !note.is_empty() {
+        println!("  note: {note}");
+    }
+    let overtxt = if over { " — OVER: run rp gc" } else { "" };
+    println!("  store: {mb} MB / {} MB budget{overtxt}", c.budget_mb);
 }
 
 fn cmd_warm(c: &Cfg, path: &str) {
+    if !Path::new(path).exists() {
+        die_input(&format!("no such path: {path}"));
+    }
     let root = repo_root(&abs(path));
     record(c, &root);
-    println!("rp: graphicle sync {root} (background)");
+    say(format!("rp: graphicle sync {root} (background)"));
     let (rc, o) = run("graphicle", &["sync", &root, "--background"]);
-    println!("{}", tail(&o, 3));
+    say(tail(&o, 3));
     if rc != 0 {
         eprintln!("rp: sync failed");
         exit(1);
     }
-    println!("rp: store now {} MB", du_mb(&c.gstore));
+    say(format!("rp: store now {} MB", du_mb(&c.gstore)));
 }
 
 fn cmd_docs(c: &Cfg, path: &str) {
+    if !Path::new(path).exists() {
+        die_input(&format!("no such path: {path}"));
+    }
     let root = repo_root(&abs(path));
     record(c, &root);
     let (_, o) = run(
@@ -350,12 +515,12 @@ fn cmd_docs(c: &Cfg, path: &str) {
     );
     let found = o.lines().filter(|l| !l.is_empty()).count();
     // context-mode defaults to --max-files 200 and silently under-indexes any real repo.
-    let cap = found.min(3000).max(1).to_string();
+    let cap = found.clamp(1, 3000).to_string();
     let src = format!("repo:{}", base(&root));
-    println!(
+    say(format!(
         "rp: context-mode index {root} ({cap} files, ~{} MB)",
         cap.parse::<u64>().unwrap_or(0) * 205 / 1024
-    );
+    ));
     let (rc, o2) = run(
         "node",
         &[
@@ -372,12 +537,14 @@ fn cmd_docs(c: &Cfg, path: &str) {
             "8",
         ],
     );
-    println!("{}", tail(&o2, 3));
+    say(tail(&o2, 3));
     if rc != 0 {
         eprintln!("rp: index failed");
         exit(1);
     }
-    let _ = fs::File::create(mark_path(c, &root));
+    if let Err(e) = fs::File::create(mark_path(c, &root)) {
+        warn_io("index mark write", &e);
+    }
 }
 
 fn label_for(c: &Cfg, l: &Ledger, p: &str) -> String {
@@ -399,7 +566,6 @@ fn label_for(c: &Cfg, l: &Ledger, p: &str) -> String {
 }
 
 fn cmd_top(c: &Cfg, k: usize) {
-    println!("most-visited repos (warm candidates):");
     let l = read_ledger(c);
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for (_, p) in &l {
@@ -407,7 +573,24 @@ fn cmd_top(c: &Cfg, k: usize) {
     }
     let mut rows: Vec<(usize, String)> = counts.into_iter().map(|(p, cnt)| (cnt, p)).collect();
     rows.sort_by_key(|(cnt, p)| (Reverse(*cnt), p.clone()));
-    for (cnt, p) in rows.into_iter().take(k) {
+    rows.truncate(k);
+    if json_on() {
+        let items: Vec<String> = rows
+            .iter()
+            .map(|(cnt, p)| {
+                format!(
+                    "{{\"path\":{},\"visits\":{},\"label\":{}}}",
+                    jstr(p),
+                    cnt,
+                    jstr(&label_for(c, &l, p))
+                )
+            })
+            .collect();
+        println!("{{\"repos\":{}}}", jarr_raw(&items));
+        return;
+    }
+    println!("most-visited repos (warm candidates):");
+    for (cnt, p) in rows {
         println!("  {cnt:4}  {p:<42} {}", label_for(c, &l, &p));
     }
 }
@@ -425,7 +608,10 @@ fn store_folders(c: &Cfg) -> Vec<(String, String)> {
         return Vec::new();
     }
     o.lines()
-        .filter_map(|l| l.split_once('\t').map(|(a, b)| (a.to_string(), b.to_string())))
+        .filter_map(|l| {
+            l.split_once('\t')
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+        })
         .collect()
 }
 
@@ -452,55 +638,110 @@ fn cmd_gc(c: &Cfg) {
             println!("  {}  {p}", fmt_date(*t));
         }
     } else {
-        println!("registered folders (store order, oldest first): {}/{} shown", folders.len().min(40), folders.len());
+        println!(
+            "registered folders (store order, oldest first): {}/{} shown",
+            folders.len().min(40),
+            folders.len()
+        );
         for (u, p) in folders.iter().take(40) {
             println!("  {u}  {p}");
         }
     }
     println!("clone cache: {} MB", du_mb(&c.cache));
-    println!("no per-project delete exists in the graphicle CLI (verified: delete_* / forget_* all");
+    println!(
+        "no per-project delete exists in the graphicle CLI (verified: delete_* / forget_* all"
+    );
     println!("return \"Unsupported native project operation\") — so the store only grows.");
-    println!("To reclaim: graphicle backup && mv ~/.local/share/graphicle ~/.local/share/graphicle.old,");
-    println!("then rp warm only what you need. Prevention beats cleanup: rp warms on repeat visits.");
+    println!(
+        "To reclaim: graphicle backup && mv ~/.local/share/graphicle ~/.local/share/graphicle.old,"
+    );
+    println!(
+        "then rp warm only what you need. Prevention beats cleanup: rp warms on repeat visits."
+    );
 }
 
 fn cmd_get(c: &Cfg, raw: &str) {
     let slug = norm_slug(raw);
+    if !valid_slug(&slug) {
+        die_input(&format!("invalid repo slug: {raw} (want owner/repo)"));
+    }
     let dest = c.cache.join(base(&slug));
     if dest.join(".git").exists() {
         return cmd_state(c, &dest.to_string_lossy());
     }
     record(c, &format!("remote:{slug}"));
+    let cmds = [
+        (
+            "search",
+            format!("gh search code 'PATTERN' --repo {slug} --limit 20"),
+        ),
+        (
+            "tree",
+            format!("gh api repos/{slug}/git/trees/HEAD?recursive=1 --jq '.tree[].path'"),
+        ),
+        (
+            "file",
+            format!("gh api repos/{slug}/contents/PATH --jq .content | base64 -d"),
+        ),
+    ];
+    if json_on() {
+        let cjson: Vec<String> = cmds
+            .iter()
+            .map(|(k, v)| format!("{}:{}", jstr(k), jstr(v)))
+            .collect();
+        println!(
+            "{{\"repo\":{},\"tier\":\"R0\",\"cloned\":false,\"commands\":{{{}}},\"notes\":{}}}",
+            jstr(&slug),
+            cjson.join(","),
+            jarr(&[
+                "search cap is 30/min — batch queries, never loop per file".into(),
+                format!(
+                    "clone only when you will grep more than ~5 times: rp clone {slug} [subpath]"
+                ),
+            ])
+        );
+        return;
+    }
     println!("repo: {slug}  tier: R0 remote — NOT cloned (a clone costs 50-460 MB and 10-40s)");
-    println!("  search: gh search code 'PATTERN' --repo {slug} --limit 20        (~0.8s, 0 MB)");
-    println!(
-        "  tree:   gh api repos/{slug}/git/trees/HEAD?recursive=1 --jq '.tree[].path' | head -60"
-    );
-    println!("  file:   gh api repos/{slug}/contents/PATH --jq .content | base64 -d | head -80");
+    for (k, v) in &cmds {
+        println!("  {k}: {v}");
+    }
     println!("  search cap is 30/min — batch queries, never loop per file");
     println!("  clone only when you will grep more than ~5 times: rp clone {slug} [subpath]");
 }
 
 fn cmd_clone(c: &Cfg, raw: &str, sub: Option<&str>) {
     let slug = norm_slug(raw);
+    if !valid_slug(&slug) {
+        die_input(&format!("invalid repo slug: {raw} (want owner/repo)"));
+    }
+    if let Some(sp) = sub {
+        if !valid_subpath(sp) {
+            die_input(&format!(
+                "invalid subpath: {sp} (repo-relative; no absolute path, no '..')"
+            ));
+        }
+    }
     let dest = c.cache.join(base(&slug));
     let ds = dest.to_string_lossy().into_owned();
     if dest.join(".git").exists() {
-        println!("rp: already cloned at {ds}");
+        say(format!("rp: already cloned at {ds}"));
         return cmd_state(c, &ds);
     }
     let free = free_gb();
     if free < c.floor_gb {
-        println!(
+        say(format!(
             "rp: only {free} GB free (< {} GB floor) — evicting LRU clones first",
             c.floor_gb
-        );
+        ));
         evict(c);
     }
     let url = format!("https://github.com/{slug}");
     match sub {
         Some(sp) => {
-            println!("rp: sparse clone {slug} -> only '{sp}' (cheapest by far on monorepos)");
+            say(format!(
+                "rp: sparse clone {slug} -> only '{sp}' (cheapest by far on monorepos)"
+            ));
             let (rc, o) = run("git", &["clone", "--depth", "1", "--sparse", &url, &ds]);
             if rc != 0 {
                 eprintln!("rp: clone failed\n{}", tail(&o, 3));
@@ -513,7 +754,7 @@ fn cmd_clone(c: &Cfg, raw: &str, sub: Option<&str>) {
             }
         }
         None => {
-            println!("rp: shallow clone {slug} (whole tree)");
+            say(format!("rp: shallow clone {slug} (whole tree)"));
             let (rc, o) = run("git", &["clone", "--depth", "1", &url, &ds]);
             if rc != 0 {
                 eprintln!("rp: clone failed\n{}", tail(&o, 3));
@@ -522,12 +763,15 @@ fn cmd_clone(c: &Cfg, raw: &str, sub: Option<&str>) {
         }
     }
     record(c, &ds);
-    println!(
+    say(format!(
         "rp: {ds} = {} MB, {} files",
         du_mb(Path::new(&ds)),
         count_files(&ds)
-    );
-    println!("rp: free now {} GB; expand: git -C {ds} sparse-checkout add <dir>", free_gb());
+    ));
+    say(format!(
+        "rp: free now {} GB; expand: git -C {ds} sparse-checkout add <dir>",
+        free_gb()
+    ));
 }
 
 fn clones(c: &Cfg) -> Vec<(i64, u64, usize, String)> {
@@ -549,14 +793,37 @@ fn clones(c: &Cfg) -> Vec<(i64, u64, usize, String)> {
 }
 
 fn cmd_cache(c: &Cfg) {
-    println!(
-        "clone cache: {} ({} MB / {} GB budget)",
-        c.cache.display(),
-        du_mb(&c.cache),
-        c.cache_mb / 1024
-    );
+    let total = du_mb(&c.cache);
     let mut rows = clones(c);
     rows.sort_by_key(|(t, _, _, _)| *t);
+    if json_on() {
+        let items: Vec<String> = rows
+            .iter()
+            .map(|(t, mb, dirty, p)| {
+                format!(
+                    "{{\"path\":{},\"mb\":{},\"last_ts\":{},\"last\":{},\"dirty\":{}}}",
+                    jstr(p),
+                    mb,
+                    t,
+                    jstr(&fmt_date(*t)),
+                    dirty
+                )
+            })
+            .collect();
+        println!(
+            "{{\"cache_dir\":{},\"total_mb\":{},\"budget_mb\":{},\"clones\":{}}}",
+            jstr(&c.cache.display().to_string()),
+            total,
+            c.cache_mb,
+            jarr(&items)
+        );
+        return;
+    }
+    println!(
+        "clone cache: {} ({total} MB / {} GB budget)",
+        c.cache.display(),
+        c.cache_mb / 1024
+    );
     for (t, mb, dirty, p) in rows {
         println!("  {mb:6} MB  last={}  dirty={dirty}  {p}", fmt_date(t));
     }
@@ -599,43 +866,6 @@ fn arg(args: &[String], i: usize) -> String {
     args.get(i).cloned().unwrap_or_else(|| ".".into())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::fmt_date;
-
-    #[test]
-    fn unix_origin_formats() {
-        assert_eq!(fmt_date(1), "1970-01-01");
-    }
-
-    #[test]
-    fn known_timestamps() {
-        assert_eq!(fmt_date(1_735_689_600), "2025-01-01");
-        assert_eq!(fmt_date(1_704_067_199), "2023-12-31");
-        assert_eq!(fmt_date(1_792_089_573), "2026-10-15");
-    }
-
-    #[test]
-    fn leap_day() {
-        // 2024-02-29 00:00:00 UTC
-        assert_eq!(fmt_date(1_709_164_800), "2024-02-29");
-    }
-
-    #[test]
-    fn no_touch_formats_as_never() {
-        assert_eq!(fmt_date(0), "never");
-        assert_eq!(fmt_date(-1), "never");
-    }
-
-    #[test]
-    fn slug_normalisation_strips_transport() {
-        use super::norm_slug;
-        assert_eq!(norm_slug("https://github.com/pallets/click.git"), "pallets/click");
-        assert_eq!(norm_slug("git@github.com:pallets/click"), "pallets/click");
-        assert_eq!(norm_slug("  pallets/click/  "), "pallets/click");
-    }
-}
-
 const POINTER_START: &str =
     "<!-- repo-tiers:start (written by `rp install`; delete the block to opt out) -->";
 const POINTER_END: &str = "<!-- repo-tiers:end -->";
@@ -670,10 +900,7 @@ fn upsert_pointer(md: &Path, block: &str) -> &'static str {
     };
     // Keep exactly one blank line after the end marker, whichever branch ran.
     // Written as a replace so a re-install never stacks a second blank line.
-    let new = new.replace(
-        &format!("{POINTER_END}\n#"),
-        &format!("{POINTER_END}\n\n#"),
-    );
+    let new = new.replace(&format!("{POINTER_END}\n#"), &format!("{POINTER_END}\n\n#"));
     if new == cur {
         return "unchanged";
     }
@@ -728,7 +955,10 @@ fn cmd_install(c: &Cfg) {
     // re-run never tries to overwrite the file it is running from.
     if let Ok(exe) = env::current_exe() {
         if exe.to_string_lossy().contains("/target/") {
-            let dest = PathBuf::from(svar("RP_BIN", &format!("{}/.local/bin/rp", svar("HOME", "."))));
+            let dest = PathBuf::from(svar(
+                "RP_BIN",
+                &format!("{}/.local/bin/rp", svar("HOME", ".")),
+            ));
             if dest != exe.canonicalize().unwrap_or_else(|_| exe.clone()) {
                 if let Some(p) = dest.parent() {
                     let _ = fs::create_dir_all(p);
@@ -744,6 +974,76 @@ fn cmd_install(c: &Cfg) {
                 );
             }
         }
+    }
+}
+
+/// Cut the marked pointer block out of AGENTS.md and collapse the gap it leaves.
+/// Prose outside the markers is never touched.
+fn remove_pointer(md: &Path) -> &'static str {
+    let Ok(cur) = fs::read_to_string(md) else {
+        return "absent";
+    };
+    let (Some(s), Some(e)) = (cur.find(POINTER_START), cur.find(POINTER_END)) else {
+        return "absent";
+    };
+    if e < s {
+        return "absent";
+    }
+    let mut new = format!("{}{}", &cur[..s], &cur[e + POINTER_END.len()..]);
+    while new.contains("\n\n\n") {
+        new = new.replace("\n\n\n", "\n\n");
+    }
+    if s == 0 {
+        new = new.trim_start_matches('\n').to_string();
+    }
+    if fs::write(md, new).is_err() {
+        return "FAILED";
+    }
+    "removed"
+}
+
+/// Undo `install`. The skill dir is only removed if it really is the repo-tiers skill.
+fn cmd_uninstall(c: &Cfg, all: bool) {
+    println!(
+        "  {:<10} {}",
+        remove_pointer(&c.agent_md),
+        c.agent_md.display()
+    );
+    let sk = c.skills.join("SKILL.md");
+    if sk.exists() {
+        let ours = fs::read_to_string(&sk)
+            .map(|t| t.contains("name: repo-tiers"))
+            .unwrap_or(false);
+        if !ours {
+            println!(
+                "  {:<10} {} (not the repo-tiers skill; left alone)",
+                "skipped",
+                c.skills.display()
+            );
+        } else if let Err(e) = fs::remove_dir_all(&c.skills) {
+            warn_io("skill dir removal", &e);
+        } else {
+            println!("  {:<10} {}", "removed", c.skills.display());
+        }
+    } else {
+        println!("  {:<10} {}", "absent", c.skills.display());
+    }
+    if all {
+        let bin = PathBuf::from(svar(
+            "RP_BIN",
+            &format!("{}/.local/bin/rp", svar("HOME", ".")),
+        ));
+        if bin.exists() {
+            if let Err(e) = fs::remove_file(&bin) {
+                warn_io("binary removal", &e);
+            } else {
+                println!("  {:<10} {}", "removed", bin.display());
+            }
+        } else {
+            println!("  {:<10} {}", "absent", bin.display());
+        }
+    } else {
+        println!("  {:<10} binary (pass --all to remove it)", "kept");
     }
 }
 
@@ -777,7 +1077,14 @@ fn cmd_doctor(c: &Cfg) {
     let mut rows: Vec<(&'static str, &'static str, String, &'static str)> = Vec::new();
 
     let (rc, o) = run("git", &["--version"]);
-    push_row(&mut rows, "git", rc, &o, false, "install git: the clone tier depends on it");
+    push_row(
+        &mut rows,
+        "git",
+        rc,
+        &o,
+        false,
+        "install git: the clone tier depends on it",
+    );
     let (rc, o) = run("gh", &["--version"]);
     push_row(
         &mut rows,
@@ -806,7 +1113,14 @@ fn cmd_doctor(c: &Cfg) {
         "install graphicle, or skip the T2 tier",
     );
     let (rc, o) = run("node", &["--version"]);
-    push_row(&mut rows, "node", rc, &o, true, "context-mode's CLI needs node");
+    push_row(
+        &mut rows,
+        "node",
+        rc,
+        &o,
+        true,
+        "context-mode's CLI needs node",
+    );
     let ctx_ok = Path::new(&c.ctxbin).exists();
     rows.push((
         "context-mode cli",
@@ -815,7 +1129,14 @@ fn cmd_doctor(c: &Cfg) {
         "npm i -g context-mode, or export CTX_MODE_CLI=<path>",
     ));
     let (rc, o) = run("cargo", &["--version"]);
-    push_row(&mut rows, "cargo", rc, &o, true, "only needed to rebuild rp");
+    push_row(
+        &mut rows,
+        "cargo",
+        rc,
+        &o,
+        true,
+        "only needed to rebuild rp",
+    );
 
     let free = free_gb();
     rows.push((
@@ -874,6 +1195,33 @@ fn cmd_doctor(c: &Cfg) {
 
     let mut miss = 0;
     let mut warn = 0;
+    if json_on() {
+        let items: Vec<String> = rows
+            .iter()
+            .map(|(n, s, d, f)| {
+                format!(
+                    "{{\"name\":{},\"status\":{},\"detail\":{},\"fix\":{}}}",
+                    jstr(n),
+                    jstr(s),
+                    jstr(d),
+                    jstr(f)
+                )
+            })
+            .collect();
+        let jmiss = rows.iter().filter(|r| r.1 == "miss").count();
+        let jwarn = rows.iter().filter(|r| r.1 == "warn").count();
+        println!(
+            "{{\"checks\":{},\"ok\":{},\"warn\":{},\"miss\":{}}}",
+            jarr_raw(&items),
+            rows.len() - jmiss - jwarn,
+            jwarn,
+            jmiss
+        );
+        if jmiss > 0 {
+            exit(1);
+        }
+        return;
+    }
     for (name, st, detail, fix) in &rows {
         let tag = match *st {
             "ok" => "[ ok ]",
@@ -891,7 +1239,10 @@ fn cmd_doctor(c: &Cfg) {
             println!("       → {fix}");
         }
     }
-    println!("\n{} ok · {warn} warn · {miss} miss", rows.len() - warn - miss);
+    println!(
+        "\n{} ok · {warn} warn · {miss} miss",
+        rows.len() - warn - miss
+    );
     if miss > 0 {
         exit(1);
     }
@@ -909,7 +1260,24 @@ fn main() {
         exit(1);
     }));
 
-    let args: Vec<String> = env::args().skip(1).collect();
+    let mut args: Vec<String> = Vec::new();
+    let mut all = false;
+    for a in env::args().skip(1) {
+        match a.as_str() {
+            "-j" | "--json" => JSON.store(true, Ordering::Relaxed),
+            "-q" | "--quiet" => QUIET.store(true, Ordering::Relaxed),
+            "-V" | "--version" => {
+                println!("rp {VERSION}");
+                return;
+            }
+            "-h" | "--help" | "help" => {
+                println!("{USAGE}");
+                return;
+            }
+            "--all" => all = true,
+            _ => args.push(a),
+        }
+    }
     let c = Cfg::new();
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("state");
     match cmd {
@@ -938,11 +1306,57 @@ fn main() {
         "cache" => cmd_cache(&c),
         "evict" => evict(&c),
         "install" => cmd_install(&c),
+        "uninstall" => cmd_uninstall(&c, all),
         "doctor" => cmd_doctor(&c),
         "-h" | "--help" | "help" => println!("{USAGE}"),
         other => {
             eprintln!("rp: unknown command: {other}\n{USAGE}");
             exit(2);
         }
+    }
+
+    // A swallowed I/O failure must not look like success.
+    if ERRORS.load(Ordering::Relaxed) > 0 {
+        exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_date;
+
+    #[test]
+    fn unix_origin_formats() {
+        assert_eq!(fmt_date(1), "1970-01-01");
+    }
+
+    #[test]
+    fn known_timestamps() {
+        assert_eq!(fmt_date(1_735_689_600), "2025-01-01");
+        assert_eq!(fmt_date(1_704_067_199), "2023-12-31");
+        assert_eq!(fmt_date(1_792_089_573), "2026-10-15");
+    }
+
+    #[test]
+    fn leap_day() {
+        // 2024-02-29 00:00:00 UTC
+        assert_eq!(fmt_date(1_709_164_800), "2024-02-29");
+    }
+
+    #[test]
+    fn no_touch_formats_as_never() {
+        assert_eq!(fmt_date(0), "never");
+        assert_eq!(fmt_date(-1), "never");
+    }
+
+    #[test]
+    fn slug_normalisation_strips_transport() {
+        use super::norm_slug;
+        assert_eq!(
+            norm_slug("https://github.com/pallets/click.git"),
+            "pallets/click"
+        );
+        assert_eq!(norm_slug("git@github.com:pallets/click"), "pallets/click");
+        assert_eq!(norm_slug("  pallets/click/  "), "pallets/click");
     }
 }

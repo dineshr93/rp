@@ -93,5 +93,3 @@ Everything is env-overridable, so nothing is hardcoded to this machine:
 | `RP_BIN` | `~/.local/bin/rp` | binary install target |
 | `GRAPHICLE_DATA_DIR` | `~/.local/share/graphicle` | graphicle store |
 | `CTX_MODE_CLI` | `~/.pi/agent/npm/node_modules/context-mode/cli.bundle.mjs` | context-mode CLI |
-
-The pre-port bash version sits at `~/.local/bin/rp.bash`. Delete it once the Rust binary has earned the trust.

@@ -2,6 +2,29 @@
 
 All notable changes to `rp` are documented here.
 
+## [1.2.0] - 2026-10-15
+
+### Added
+
+- Skill install is now a library + symlink model. The skill lives once in the shared
+  library at `RP_SKILLS` (`~/.agents/skills/repo-tiers`), and `rp install --agents`
+  symlinks that copy into each agent's own skills dir — `~/.claude/skills/repo-tiers`,
+  `~/.cursor/skills/repo-tiers`, `~/.hermes/skills/repo-tiers` and the rest — the
+  same wiring every other skill on a shared-skills box already uses.
+- `rp agents` reports the skill link state per agent; `--json` adds `skill_link`
+  (`linked` / `elsewhere` / `foreign` / `none`) and `skill_link_path`.
+
+### Fixed
+
+- `rp install --agents` only wrote memory-file pointers, so no agent's skill loader
+  could actually discover `repo-tiers` — the rule was readable but never fired as a
+  skill. Each agent now gets both: the link for discovery, the pointer for always-on
+  routing.
+- Links are never clobbered. An existing link pointing at another directory reports
+  `link points elsewhere`; a real directory sitting at the link path reports
+  `foreign skill dir`; both are left byte for byte, pinned by
+  `a_link_pointing_elsewhere_is_left_alone` and `a_foreign_skill_dir_is_never_clobbered`.
+
 ## [1.1.0] - 2026-10-15
 
 ### Added

@@ -893,35 +893,128 @@ fn pointer_block(skills: &str) -> String {
 struct AgentTarget {
     name: &'static str,
     path: PathBuf,
+    /// Where this agent looks for skills. The skill itself lives once in the shared
+    /// ~/.agents/skills library and is symlinked in here, the way every other
+    /// skill on this box is wired.
+    skills_dir: PathBuf,
     /// Cursor loads `.mdc` rule files with frontmatter instead of a plain memory file.
     cursor_rule: bool,
 }
 
 fn agent_targets() -> Vec<AgentTarget> {
     let home = svar("HOME", ".");
-    let t = |name: &'static str, rel: String, cursor_rule: bool| AgentTarget {
+    let t = |name: &'static str, rel: String, skills_rel: String, cursor_rule: bool| AgentTarget {
         name,
         path: PathBuf::from(rel),
+        skills_dir: PathBuf::from(skills_rel),
         cursor_rule,
     };
     vec![
-        t("pi", format!("{home}/.pi/agent/AGENTS.md"), false),
-        t("claude", format!("{home}/.claude/CLAUDE.md"), false),
-        t("codex", format!("{home}/.codex/AGENTS.md"), false),
-        t("gemini", format!("{home}/.gemini/GEMINI.md"), false),
-        t("copilot", format!("{home}/.copilot/instructions.md"), false),
+        t(
+            "pi",
+            format!("{home}/.pi/agent/AGENTS.md"),
+            format!("{home}/.pi/agent/skills"),
+            false,
+        ),
+        t(
+            "claude",
+            format!("{home}/.claude/CLAUDE.md"),
+            format!("{home}/.claude/skills"),
+            false,
+        ),
+        t(
+            "codex",
+            format!("{home}/.codex/AGENTS.md"),
+            format!("{home}/.codex/skills"),
+            false,
+        ),
+        t(
+            "gemini",
+            format!("{home}/.gemini/GEMINI.md"),
+            format!("{home}/.gemini/skills"),
+            false,
+        ),
+        t(
+            "copilot",
+            format!("{home}/.copilot/instructions.md"),
+            format!("{home}/.copilot/skills"),
+            false,
+        ),
         t(
             "cursor",
             format!("{home}/.cursor/rules/repo-tiers.mdc"),
+            format!("{home}/.cursor/skills"),
             true,
         ),
         t(
             "opencode",
             format!("{home}/.config/opencode/AGENTS.md"),
+            format!("{home}/.config/opencode/skills"),
             false,
         ),
-        t("hermes", format!("{home}/.hermes/AGENTS.md"), false),
+        t(
+            "hermes",
+            format!("{home}/.hermes/AGENTS.md"),
+            format!("{home}/.hermes/skills"),
+            false,
+        ),
     ]
+}
+
+#[cfg(unix)]
+fn make_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(not(unix))]
+fn make_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "skill symlinks need a unix filesystem",
+    ))
+}
+
+/// Symlink the shared skill library entry into one agent's skills dir, so that
+/// agent's skill loader discovers `repo-tiers`. Never clobbers: a link pointing
+/// somewhere else, or a real directory we did not create, is reported and left be.
+fn link_skill(skills_dir: &Path, skill_root: &Path) -> &'static str {
+    let link = skills_dir.join("repo-tiers");
+    if let Ok(target) = fs::read_link(&link) {
+        return if target == skill_root {
+            "unchanged"
+        } else {
+            "skipped (link points elsewhere)"
+        };
+    }
+    if link.exists() {
+        return "skipped (foreign skill dir)";
+    }
+    if let Err(e) = fs::create_dir_all(skills_dir) {
+        warn_io("cannot create agent skills dir", &e);
+        return "FAILED";
+    }
+    match make_symlink(skill_root, &link) {
+        Ok(()) => "linked",
+        Err(e) => {
+            warn_io("skill symlink", &e);
+            "FAILED"
+        }
+    }
+}
+
+/// Remove only a link we recognise. A real directory at that path is never touched.
+fn unlink_skill(skills_dir: &Path, skill_root: &Path) -> bool {
+    let link = skills_dir.join("repo-tiers");
+    match fs::read_link(&link) {
+        Ok(target) if target == skill_root => match fs::remove_file(&link) {
+            Ok(()) => true,
+            Err(e) => {
+                warn_io("skill symlink removal", &e);
+                false
+            }
+        },
+        _ => false,
+    }
 }
 
 fn cursor_rule_text(skills: &str) -> String {
@@ -996,15 +1089,30 @@ fn resolve_agents(spec: &str) -> Result<Vec<String>, String> {
 fn cmd_agents(c: &Cfg) {
     let skills = c.skills.display().to_string();
     if json_on() {
+        let skills_root = c.skills.clone();
         let items: Vec<String> = agent_targets()
             .iter()
             .map(|t| {
+                let link = t.skills_dir.join("repo-tiers");
+                let state = match fs::read_link(&link) {
+                    Ok(target) if target == skills_root => "linked",
+                    Ok(_) => "elsewhere",
+                    Err(_) => {
+                        if link.exists() {
+                            "foreign"
+                        } else {
+                            "none"
+                        }
+                    }
+                };
                 format!(
-                    "{{\"agent\":{},\"memory_file\":{},\"exists\":{},\"rp_installed\":{}}}",
+                    "{{\"agent\":{},\"memory_file\":{},\"exists\":{},\"rp_installed\":{},\"skill_link\":{},\"skill_link_path\":{}}}",
                     jstr(t.name),
                     jstr(&t.path.display().to_string()),
                     t.path.exists(),
-                    target_ours(&t.path, t.cursor_rule)
+                    target_ours(&t.path, t.cursor_rule),
+                    jstr(state),
+                    jstr(&link.display().to_string())
                 )
             })
             .collect();
@@ -1015,20 +1123,31 @@ fn cmd_agents(c: &Cfg) {
         );
         return;
     }
-    println!("agent memory files rp can write:\n");
+    let skills_root = c.skills.clone();
+    println!("shared skill library: {}\n", skills_root.display());
     for t in agent_targets() {
-        let here = if t.path.exists() {
-            "file present"
-        } else {
-            "no file yet"
-        };
+        let here = if t.path.exists() { "present" } else { "absent" };
         let ours = if target_ours(&t.path, t.cursor_rule) {
-            "rp pointer: yes"
+            "yes"
         } else {
-            "rp pointer: no"
+            "no"
+        };
+        let link = t.skills_dir.join("repo-tiers");
+        let linked = match fs::read_link(&link) {
+            Ok(target) if target == skills_root => "linked here",
+            Ok(_) => "link points elsewhere",
+            Err(_) => {
+                if link.exists() {
+                    "foreign dir in the way"
+                } else {
+                    "not linked"
+                }
+            }
         };
         println!("  {:<10} {}", t.name, t.path.display());
-        println!("  {:<10} {here} · {ours}", "");
+        println!("  {:<10} memory {here} · rp pointer {ours}", "");
+        println!("  {:<10} {}", "", link.display());
+        println!("  {:<10} skill {linked}", "");
     }
     println!("\nwrite them with: rp install --agents all   (or a comma list)");
 }
@@ -1106,12 +1225,20 @@ fn cmd_install(c: &Cfg, agents: &[String], files: &[String]) {
     } else {
         for want in agents {
             match agent_targets().into_iter().find(|t| t.name == *want) {
-                Some(t) => println!(
-                    "  {:<10} {}  [{}]",
-                    install_target(&t.path, t.cursor_rule, &skills),
-                    t.path.display(),
-                    t.name
-                ),
+                Some(t) => {
+                    println!(
+                        "  {:<10} {}  [{} memory]",
+                        install_target(&t.path, t.cursor_rule, &skills),
+                        t.path.display(),
+                        t.name
+                    );
+                    println!(
+                        "  {:<10} {}  [{} skills]",
+                        link_skill(&t.skills_dir, &c.skills),
+                        t.skills_dir.join("repo-tiers").display(),
+                        t.name
+                    );
+                }
                 None => {
                     eprintln!("rp: unknown agent {want}");
                     exit(2);
@@ -1187,6 +1314,14 @@ fn cmd_uninstall(c: &Cfg, all: bool) {
         c.agent_md.display()
     );
     for t in agent_targets() {
+        if unlink_skill(&t.skills_dir, &c.skills) {
+            println!(
+                "  {:<10} {}  [{} skills]",
+                "removed",
+                t.skills_dir.join("repo-tiers").display(),
+                t.name
+            );
+        }
         if t.path == c.agent_md || !target_ours(&t.path, t.cursor_rule) {
             continue;
         }

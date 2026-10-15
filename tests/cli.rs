@@ -198,6 +198,22 @@ esac
         .collect()
     }
 
+    fn agent_skill_links(&self) -> Vec<PathBuf> {
+        [
+            ".pi/agent/skills/repo-tiers",
+            ".claude/skills/repo-tiers",
+            ".codex/skills/repo-tiers",
+            ".gemini/skills/repo-tiers",
+            ".copilot/skills/repo-tiers",
+            ".cursor/skills/repo-tiers",
+            ".config/opencode/skills/repo-tiers",
+            ".hermes/skills/repo-tiers",
+        ]
+        .iter()
+        .map(|f| self.tmp.join(f))
+        .collect()
+    }
+
     fn ledger_lines(&self) -> usize {
         fs::read_to_string(self.tmp.join("ledger.tsv"))
             .map(|s| s.lines().count())
@@ -526,6 +542,46 @@ fn install_agents_all_reaches_every_memory_file() {
     let c = fs::read_to_string(e.tmp.join(".cursor/rules/repo-tiers.mdc")).unwrap();
     assert_eq!(c, "foreign cursor rule\n");
     assert!(s.contains("skipped"), "{s}");
+    // Every agent gets the shared skill symlinked into its own skills dir, so the
+    // agent's skill loader discovers repo-tiers, not just its memory file.
+    for l in e.agent_skill_links() {
+        let target =
+            fs::read_link(&l).unwrap_or_else(|e| panic!("{} is not a symlink: {e}", l.display()));
+        assert_eq!(target, e.tmp.join("skills"), "{} wrong target", l.display());
+    }
+}
+
+#[test]
+fn a_foreign_skill_dir_is_never_clobbered() {
+    let e = Env::new("foreignskill");
+    e.seed_skill_src();
+    let mine = e.tmp.join(".claude/skills/repo-tiers");
+    fs::create_dir_all(&mine).unwrap();
+    fs::write(mine.join("SKILL.md"), "someone else's skill\n").unwrap();
+    let o = e.cmd(&["install", "--agents", "claude"]);
+    let s = stdout_of(&o);
+    assert!(o.status.success(), "{s}");
+    assert!(s.contains("foreign skill dir"), "{s}");
+    assert_eq!(
+        fs::read_to_string(mine.join("SKILL.md")).unwrap(),
+        "someone else's skill\n"
+    );
+}
+
+#[test]
+fn a_link_pointing_elsewhere_is_left_alone() {
+    let e = Env::new("elsewhere");
+    e.seed_skill_src();
+    let other = e.tmp.join("other-skill");
+    fs::create_dir_all(&other).unwrap();
+    let link = e.tmp.join(".codex/skills/repo-tiers");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&other, &link).unwrap();
+    let o = e.cmd(&["install", "--agents", "codex"]);
+    let s = stdout_of(&o);
+    assert!(o.status.success(), "{s}");
+    assert!(s.contains("link points elsewhere"), "{s}");
+    assert_eq!(fs::read_link(&link).unwrap(), other);
 }
 
 #[test]
@@ -560,6 +616,13 @@ fn uninstall_sweeps_every_agent_it_wrote() {
     }
     let c = fs::read_to_string(e.tmp.join(".cursor/rules/repo-tiers.mdc")).unwrap();
     assert_eq!(c, "foreign cursor rule\n", "foreign rule must survive");
+    for l in e.agent_skill_links() {
+        assert!(
+            l.symlink_metadata().is_err(),
+            "{} should be gone after uninstall",
+            l.display()
+        );
+    }
 }
 
 #[test]

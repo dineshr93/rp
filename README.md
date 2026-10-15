@@ -28,7 +28,7 @@ git clone https://github.com/dineshr93/rp && cd rp
 cargo build --release && ./target/release/rp install && rp doctor
 ```
 
-`rp install` puts the binary in `~/.local/bin/rp`, the agent skill in
+`rp install` puts the binary in `~/.local/bin/rp`, the skill in the shared library
 `~/.agents/skills/repo-tiers/`, and a marked pointer block in
 `~/.pi/agent/AGENTS.md`. It is idempotent and only ever touches its own block, so
 hand-edited notes survive. `rp uninstall` reverses it.
@@ -59,20 +59,22 @@ Environment overrides: `RP_LEDGER`, `RP_CACHE`, `RP_CACHE_GB`, `RP_FREE_FLOOR_GB
 
 ## Agent integrations
 
-`rp install --agents` writes the same pointer into each agent's global memory file,
-so the tier rule is in force whichever agent you open the next repo with. Paths
-verified on a live box:
+The skill lives **once**, in the shared library `~/.agents/skills/repo-tiers`.
+`rp install --agents` symlinks that one copy into each agent's own skills dir —
+the same wiring every other skill on this box already uses — so that agent's skill
+loader discovers it, and writes the pointer into that agent's global memory file so
+the tier rule stays on without anyone invoking it. One source, no copies to drift.
 
-| agent | file written |
-|---|---|
-| pi | `~/.pi/agent/AGENTS.md` |
-| Claude Code | `~/.claude/CLAUDE.md` |
-| Codex CLI | `~/.codex/AGENTS.md` |
-| Gemini CLI | `~/.gemini/GEMINI.md` |
-| GitHub Copilot CLI | `~/.copilot/instructions.md` |
-| Cursor | `~/.cursor/rules/repo-tiers.mdc` (an `alwaysApply` rule) |
-| OpenCode | `~/.config/opencode/AGENTS.md` |
-| Hermes | `~/.hermes/AGENTS.md` |
+| agent | memory file | skill symlinked into |
+|---|---|---|
+| pi | `~/.pi/agent/AGENTS.md` | `~/.pi/agent/skills/repo-tiers` |
+| Claude Code | `~/.claude/CLAUDE.md` | `~/.claude/skills/repo-tiers` |
+| Codex CLI | `~/.codex/AGENTS.md` | `~/.codex/skills/repo-tiers` |
+| Gemini CLI | `~/.gemini/GEMINI.md` | `~/.gemini/skills/repo-tiers` |
+| GitHub Copilot CLI | `~/.copilot/instructions.md` | `~/.copilot/skills/repo-tiers` |
+| Cursor | `~/.cursor/rules/repo-tiers.mdc` (an `alwaysApply` rule) | `~/.cursor/skills/repo-tiers` |
+| OpenCode | `~/.config/opencode/AGENTS.md` | `~/.config/opencode/skills/repo-tiers` |
+| Hermes | `~/.hermes/AGENTS.md` | `~/.hermes/skills/repo-tiers` |
 
 ```bash
 rp agents                               # what exists, and which files already carry the pointer
@@ -82,14 +84,17 @@ rp install --file ~/team/MEMORY.md      # plus any other memory file (repeatable
 rp uninstall                            # sweeps every file it wrote
 ```
 
-Nothing outside the markers is touched. Plain memory files get the block between
+Nothing you did not ask for gets touched. Plain memory files get the block between
 `<!-- repo-tiers:start -->` and `<!-- repo-tiers:end -->`; your own prose survives
-install and uninstall either way. A Cursor rule rp did not write is reported as
-`skipped (foreign rule file)` and left byte for byte. `rp agents --json` returns
-`{agent, memory_file, exists, rp_installed}` per agent for scripts.
+install and uninstall either way. A Cursor rule rp did not write is reported
+`skipped (foreign rule file)` and left byte for byte. A skill link pointing at some
+other directory reports `link points elsewhere`, and a real directory sitting at
+that path reports `foreign skill dir` — neither is ever overwritten. `rp agents
+--json` returns `{agent, memory_file, exists, rp_installed, skill_link,
+skill_link_path}` per agent for scripts.
 
 Agents with no skill loader of their own (Copilot CLI, Gemini CLI) still get the
-pointer, and it names the skill directory by path — they read `SKILL.md` and
+pointer, and it names the shared library by path — they read `SKILL.md` and
 `COSTS.md` from there the same way pi does.
 
 ## Use

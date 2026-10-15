@@ -109,8 +109,13 @@ route into a tier it cannot serve. Full install commands are in the project READ
 
 ## Installing the rule for other agents
 
-`rp install --agents all` writes the pointer into every supported agent's global
-memory file — pi, Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor,
-OpenCode, Hermes. `rp agents` (or `rp agents --json`) is the live list of paths and
-their state. Marker-guarded: your own prose survives install and uninstall, and a
-Cursor rule rp did not write is reported `skipped (foreign rule file)` and left alone.
+The skill lives once in the shared library `~/.agents/skills/repo-tiers`. `rp
+install --agents all` symlinks that copy into each agent's own skills dir (pi,
+Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor, OpenCode, Hermes)
+and writes the pointer into that agent's global memory file. `rp agents` (or
+`--json`) is the live list of paths and their state.
+
+Never clobbered: your own prose survives install and uninstall; a Cursor rule rp
+did not write is `skipped (foreign rule file)`; a link pointing elsewhere is
+`link points elsewhere`; a real directory at the link path is
+`foreign skill dir`. All left as found.

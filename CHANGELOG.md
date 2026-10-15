@@ -2,6 +2,17 @@
 
 All notable changes to `rp` are documented here.
 
+## [1.2.1] - 2026-10-15
+
+### Fixed
+
+- The bundled skill's `description` frontmatter is quoted. An unquoted `": "` in
+  the value made YAML read it as a nested mapping, so agent harnesses refused to
+  load `repo-tiers` at all — pi showed "Nested mappings are not allowed in compact
+  mappings" and the skill stayed invisible until the file was patched by hand.
+- CI parses `skill/SKILL.md` frontmatter in the lint job, so the next unquoted
+  colon on that line fails the build instead of the TUI.
+
 ## [1.2.0] - 2026-10-15
 
 ### Added

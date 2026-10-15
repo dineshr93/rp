@@ -661,7 +661,7 @@ fn remote_cmds(repo: &Repo) -> Vec<(&'static str, String)> {
                     format!("curl -s {tok} \"https://{host}/api/v1/repos/{slug}/raw/HEAD/PATH\""),
                 ),
             ]
-        },
+        }
         // No forge API: the git-native floor is all there is, and it is enough.
         Forge::Unknown => {
             let tmp = format!("/tmp/rp-{}-{}", repo.owner, repo.name);
@@ -1846,9 +1846,10 @@ fn missing_tiers(
 ) -> Vec<(&'static str, &'static str)> {
     let mut m = Vec::new();
     if !status_of(rows, "git") {
-        m.push(("R0", "install git — without it there is no remote floor at all"));
-    }
-    if !status_of(rows, "git") {
+        m.push((
+            "R0",
+            "install git — without it there is no remote floor at all",
+        ));
         m.push(("R1", "install git"));
     }
     if !(status_of(rows, "node") && status_of(rows, "context-mode cli")) {
@@ -1865,12 +1866,13 @@ fn missing_tiers(
 
 /// Per-forge: can rp actually search this box's remotes, right now. The git floor
 /// is always live; what varies is the code-search API on top of it.
-fn forge_search_report(
-    rows: &[(&'static str, &'static str, String, &'static str)],
-) -> String {
+fn forge_search_report(rows: &[(&'static str, &'static str, String, &'static str)]) -> String {
     let gh = status_of(rows, "gh cli") && status_of(rows, "gh auth");
     let curl = status_of(rows, "curl");
-    let gl_tok = !env::var("GITLAB_TOKEN").unwrap_or_default().trim().is_empty();
+    let gl_tok = !env::var("GITLAB_TOKEN")
+        .unwrap_or_default()
+        .trim()
+        .is_empty();
     let gt_tok = !env::var("GITEA_TOKEN")
         .or_else(|_| env::var("FORGEJO_TOKEN"))
         .unwrap_or_default()
@@ -1953,7 +1955,11 @@ fn cmd_doctor(c: &Cfg) {
     let gl_tok = env::var("GITLAB_TOKEN").unwrap_or_default();
     rows.push((
         "$GITLAB_TOKEN",
-        if gl_tok.trim().is_empty() { "warn" } else { "ok" },
+        if gl_tok.trim().is_empty() {
+            "warn"
+        } else {
+            "ok"
+        },
         if gl_tok.trim().is_empty() {
             "unset — private GitLab search is off".to_string()
         } else {
@@ -1966,7 +1972,11 @@ fn cmd_doctor(c: &Cfg) {
         .unwrap_or_default();
     rows.push((
         "$GITEA_TOKEN",
-        if gt_tok.trim().is_empty() { "warn" } else { "ok" },
+        if gt_tok.trim().is_empty() {
+            "warn"
+        } else {
+            "ok"
+        },
         if gt_tok.trim().is_empty() {
             "unset — Gitea/Forgejo code search is off".to_string()
         } else {
@@ -1985,12 +1995,7 @@ fn cmd_doctor(c: &Cfg) {
         },
         "gh auth login --hostname github.corp.example  (one gh login per enterprise host)",
     ));
-    rows.push((
-        "R0 forge search",
-        "warn",
-        forge_search_report(&rows),
-        "",
-    ));
+    rows.push(("R0 forge search", "warn", forge_search_report(&rows), ""));
     let (rc, o) = run("graphicle", &["--version"]);
     push_row(
         &mut rows,

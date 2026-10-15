@@ -110,11 +110,7 @@ esac
 "#,
         );
 
-        stub(
-            &bin,
-            "curl",
-            "echo 'curl stub 8.5.0'\nexit 0",
-        );
+        stub(&bin, "curl", "echo 'curl stub 8.5.0'\nexit 0");
 
         // node: the context-mode CLI stand-in.
         stub(
@@ -384,7 +380,10 @@ fn a_gitlab_repo_routes_to_the_gitlab_api_not_gh() {
     let s = e.out(&["get", "gitlab.com/gitlab-org/cli"]);
     assert!(s.contains("forge: gitlab"), "{s}");
     assert!(s.contains("/api/v4/projects/gitlab-org%2Fcli"), "{s}");
-    assert!(!s.contains("gh search"), "must not hand back gh for gitlab: {s}");
+    assert!(
+        !s.contains("gh search"),
+        "must not hand back gh for gitlab: {s}"
+    );
     assert!(s.contains("git ls-remote --symref"), "{s}");
     assert!(
         !e.tmp.join("cache/cli/.git").exists(),
@@ -431,7 +430,9 @@ fn an_unknown_host_falls_to_the_git_floor() {
     let s = e.out(&["get", "git.self-hosted.io/a/b"]);
     assert!(s.contains("forge: unknown"), "{s}");
     assert!(
-        s.contains("floor (no token, 0 MB): git ls-remote --symref https://git.self-hosted.io/a/b HEAD"),
+        s.contains(
+            "floor (no token, 0 MB): git ls-remote --symref https://git.self-hosted.io/a/b HEAD"
+        ),
         "{s}"
     );
 }
@@ -448,23 +449,20 @@ fn clone_uses_the_url_it_was_given_not_github() {
 #[test]
 fn two_forges_with_the_same_repo_name_get_two_directories() {
     let e = Env::new("collide");
-    assert!(e
-        .cmd(&["clone", "github.com/a/cli"])
-        .status
-        .success());
-    assert!(e
-        .cmd(&["clone", "gitlab.com/a/cli"])
-        .status
-        .success());
+    assert!(e.cmd(&["clone", "github.com/a/cli"]).status.success());
+    assert!(e.cmd(&["clone", "gitlab.com/a/cli"]).status.success());
     let bare = e.tmp.join("cache/cli/.git/ORIGIN");
     let ns = e.tmp.join("cache/gitlab.com-a-cli/.git/ORIGIN");
-    assert_eq!(fs::read_to_string(&bare).unwrap().trim(), "https://github.com/a/cli");
-    assert_eq!(fs::read_to_string(&ns).unwrap().trim(), "https://gitlab.com/a/cli");
+    assert_eq!(
+        fs::read_to_string(&bare).unwrap().trim(),
+        "https://github.com/a/cli"
+    );
+    assert_eq!(
+        fs::read_to_string(&ns).unwrap().trim(),
+        "https://gitlab.com/a/cli"
+    );
     // Re-cloning the first must reuse the bare dir, not make a third one.
-    assert!(e
-        .cmd(&["clone", "github.com/a/cli"])
-        .status
-        .success());
+    assert!(e.cmd(&["clone", "github.com/a/cli"]).status.success());
     assert!(!e.tmp.join("cache/github.com-a-cli").exists());
 }
 
@@ -484,8 +482,15 @@ fn gitlab_and_gitea_commands_guard_the_token() {
     // call with no header returns the public repo. So the header must be
     // conditional on the variable actually being set.
     let s = e.out(&["get", "gitlab.com/foo/bar"]);
-    for line in s.lines().filter(|l| l.trim_start().starts_with("search:") || l.trim_start().starts_with("tree:") || l.trim_start().starts_with("file:")) {
-        assert!(line.contains("${GITLAB_TOKEN:+"), "unguarded token header: {line}");
+    for line in s.lines().filter(|l| {
+        l.trim_start().starts_with("search:")
+            || l.trim_start().starts_with("tree:")
+            || l.trim_start().starts_with("file:")
+    }) {
+        assert!(
+            line.contains("${GITLAB_TOKEN:+"),
+            "unguarded token header: {line}"
+        );
     }
     let g = e.out(&["get", "gitea.example.com/foo/bar"]);
     assert!(g.contains("${GITEA_TOKEN:+"), "{g}");

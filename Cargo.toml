@@ -1,0 +1,13 @@
+[package]
+name = "rp"
+version = "1.0.0"
+edition = "2021"
+description = "Repo tier router: never clone or index what you touch once"
+
+# No dependencies on purpose: rp shells out to git / gh / graphicle / du / df.
+# A 225-line bash tool does not need a crate graph.
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

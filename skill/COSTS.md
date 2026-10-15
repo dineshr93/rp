@@ -16,6 +16,48 @@ Reference for [SKILL.md](SKILL.md). Every number below was measured on the box t
 | `rp warm` 362 files | 0.8s | +9 MB | 279 nodes, 289 edges |
 | `rp warm` 12k files | 18.7s | +746 MB | 42,751 nodes, 107,948 edges |
 
+## Forge routing (measured 2026-10, live calls)
+
+Every number below is the command `rp get` actually emitted, run against the real
+service. Nothing here is inferred from documentation.
+
+| forge | call | latency | disk | token |
+|---|---|---|---|---|
+| gitea/forgejo (codeberg) | `git ls-remote --symref <url> HEAD` | 0.75s | 0 MB | none |
+| gitlab.com | `git ls-remote --symref <url> HEAD` | 0.67s | 0 MB | none |
+| gitlab.com | `curl …/api/v4/projects/<id>/repository/tree` | 0.36s | 0 MB | none (public) |
+| gitlab.com | `curl …/repository/files/README.md/raw?ref=HEAD` | 0.28s | 0 MB | none (public) |
+| gitlab.com | `curl …/search?scope=blobs` | 0.24s | — | **401 without one** |
+| gitea (codeberg) | `curl …/api/v1/repos/<slug>/git/trees/HEAD` | 0.22s | 0 MB | none (public) |
+| gitea (codeberg) | `curl …/raw/HEAD/README.md` | 0.17s | 0 MB | none (public) |
+| gitea (codeberg) | `curl …/api/v1/search/code?q=repo:…` | 0.10s | — | 404 — indexer off site-wide |
+| github.com | `gh search code` / `gh api …/contents/PATH` | 0.4-0.8s | 0 MB | `gh auth` |
+| github enterprise | `GH_HOST=<h> gh …` | same | 0 MB | one `gh auth login --hostname` per host |
+
+Traps, each one measured before it was believed:
+
+- **An empty token header is worse than no header.** `curl -H "PRIVATE-TOKEN: "`
+  against a public GitLab project returns a 302 to `users/sign_in`; the same URL
+  with the header omitted returns the JSON. So the emitted command carries
+  `${GITLAB_TOKEN:+-H "PRIVATE-TOKEN: $GITLAB_TOKEN"}`, which expands to nothing
+  when the variable is unset. A literal header with an empty variable silently turns
+  every public repo into a login wall.
+- **`git archive --remote` is absent on GitHub.** Present on GitLab and Gitea, so
+  the unknown-forge floor offers it and github must use `gh api …/contents`.
+- **`ls-remote` on a repo with a huge ref history stalls.** `gitlab-org/gitlab`
+  did not answer inside a 20s timeout; `gitlab-org/cli` answered in 1.03s. Always
+  pass `HEAD` explicitly — a bare `ls-remote` there is a multi-second stall on a
+  repo with hundreds of thousands of refs.
+- **Gitea code search depends on the server.** Codeberg returns 404 for
+  `/api/v1/search/code` because the repo indexer is not enabled. A 404 is not "no
+  results", it is "this forge cannot search" — drop to the git floor.
+- **Enterprise GitHub needs no new code.** `gh` resolves `/api/v3` and finds the
+  right keyring entry from `GH_HOST` on its own; rp only prepends the variable.
+- **Cache collisions are real.** `github.com/a/cli` and `gitlab.com/a/cli` want the
+  same bare directory. `rp` keeps the bare name when its recorded origin matches
+  and falls back to `host-owner-repo` when it does not, so pre-existing clones are
+  still found and two forges never fight over one checkout.
+
 ## Clone facts
 
 - **`--filter=blob:none` buys nothing on a working-tree checkout.** vllm blobless 185 MB against shallow 184 MB. Blob filters trim history, and `--depth 1` already dropped the history. Only `--sparse` trims working-tree bytes.
@@ -66,8 +108,8 @@ rp/                      Rust, zero crates (subprocess + arithmetic)
 
 ```
 cargo build --release && ./target/release/rp install   # binary + skill + AGENTS.md pointer
-cargo test                                            # 5 tests: date math, slug normalisation
-rp doctor                                             # health of toolchain, budgets, install
+cargo test                                            # unit + hermetic CLI: parsing, routing, budgets
+rp doctor                                             # health of toolchain, forges, budgets, install
 ```
 
 `rp install` is idempotent: it reports `installed` / `unchanged` per file, replaces only its own `<!-- repo-tiers:start -->` … `<!-- repo-tiers:end -->` block, and leaves every other line of `AGENTS.md` alone. Delete that block to opt out. Run from a build tree it also copies the binary into `~/.local/bin/rp`; run from an installed path it skips that step, so `cargo install --path .` followed by `rp install` works too.
@@ -93,13 +135,19 @@ Everything is env-overridable, so nothing is hardcoded to this machine:
 | `RP_BIN` | `~/.local/bin/rp` | binary install target |
 | `GRAPHICLE_DATA_DIR` | `~/.local/share/graphicle` | graphicle store |
 | `CTX_MODE_CLI` | `~/.pi/agent/npm/node_modules/context-mode/cli.bundle.mjs` | context-mode CLI |
+| `GH_HOST` | `github.com` | default host for a bare `owner/repo`; where `gh` looks for credentials |
+| `GITLAB_TOKEN` | unset | GitLab PAT, scope `read_api` — unlocks blob search |
+| `GITEA_TOKEN` / `FORGEJO_TOKEN` | unset | Gitea/Forgejo access token — unlocks code search |
 
 ## Dependencies per tier
 
 | tier | needs | unlock |
 |---|---|---|
 | T0 | `git` | always available |
-| R0 | `gh` + `gh auth login` (`repo` scope) | remote query without cloning |
+| R0 (floor) | `git` | `ls-remote` answers **every** forge, token-free |
+| R0 (github + GHE search) | `gh` + `gh auth login` (`repo` scope); `gh auth login --hostname <h>` per enterprise host | code search on GitHub-family hosts |
+| R0 (gitlab search) | `curl` + `$GITLAB_TOKEN` (scope `read_api`) | blob search; tree/raw work without it |
+| R0 (gitea/forgejo search) | `curl` + `$GITEA_TOKEN`, server indexer on | code search; tree/raw work without it |
 | R1 | `git` | clone / sparse |
 | T1 | node ≥ 18 + `context-mode` | text index |
 | T2 | `graphicle` | code graph |

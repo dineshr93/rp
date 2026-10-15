@@ -84,8 +84,8 @@ const USAGE: &str = "usage: rp [flags] [command] [args]\n\
 \n\
 commands:\n\
   state    (default) tier of a local repo; records the visit\n\
-  get      owner/repo: answer remotely, never clone\n\
-  clone    owner/repo [subpath]: budget-checked shallow / sparse clone\n\
+  get      [host/]owner/repo: answer remotely, never clone (github, GHE, GitLab, Gitea)\n\
+  clone    [host/]owner/repo [subpath]: budget-checked shallow / sparse clone\n\
   warm     graphicle code graph (callers, impact, why)\n\
   docs     context-mode text index\n\
   top      most-visited repos = warm candidates [N]\n\
@@ -302,17 +302,424 @@ fn base(p: &str) -> String {
         .unwrap_or_else(|| p.to_string())
 }
 
-fn norm_slug(raw: &str) -> String {
-    let mut r = raw.trim();
-    for pre in ["https://github.com/", "git@github.com:"] {
-        if let Some(x) = r.strip_prefix(pre) {
-            r = x;
+/// Which forge serves a host. Decides which R0 commands rp can hand you.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Forge {
+    Github,
+    GithubEnterprise,
+    Gitlab,
+    Gitea,
+    Unknown,
+}
+
+impl Forge {
+    fn label(self) -> &'static str {
+        match self {
+            Forge::Github => "github",
+            Forge::GithubEnterprise => "github-enterprise",
+            Forge::Gitlab => "gitlab",
+            Forge::Gitea => "gitea",
+            Forge::Unknown => "unknown",
         }
     }
-    if let Some(x) = r.strip_suffix(".git") {
-        r = x;
+}
+
+/// A remote repo reference, host-qualified. A bare `owner/repo` means the default
+/// host (`GH_HOST`, else github.com); anything carrying a host keeps it, so GitLab,
+/// Gitea/Forgejo and GitHub Enterprise route the same way as github.com instead of
+/// silently becoming a github.com clone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Repo {
+    host: String,
+    owner: String,
+    name: String,
+    forge: Forge,
+    url: String,
+}
+
+impl Repo {
+    fn slug(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
     }
-    r.trim_matches('/').to_string()
+    /// Ledger and display key. Host-qualified so `gitlab.com/foo/bar` and
+    /// `github.com/foo/bar` never share a visit count or a cache directory.
+    fn key(&self) -> String {
+        format!("{}/{}", self.host, self.slug())
+    }
+    /// `owner%2Frepo` — GitLab takes the whole path as its `:id` URL segment,
+    /// and with a nested subgroup the owner carries slashes of its own.
+    fn id_enc(&self) -> String {
+        self.slug().replace('/', "%2F")
+    }
+}
+
+/// Hosts `gh` is authenticated against, straight out of `gh auth status`.
+/// The authoritative way to tell a GitHub Enterprise host from an unknown one:
+/// `gh` already knows, so rp does not have to guess from the hostname.
+fn gh_auth_hosts() -> Vec<String> {
+    let (rc, o) = run("gh", &["auth", "status"]);
+    if rc != 0 {
+        return Vec::new();
+    }
+    let mut hosts = Vec::new();
+    const MARK: &str = "Logged in to ";
+    for line in o.lines() {
+        if let Some(i) = line.find(MARK) {
+            let h: String = line[i + MARK.len()..]
+                .chars()
+                .take_while(|c| !c.is_whitespace())
+                .collect();
+            if !h.is_empty() && !hosts.iter().any(|x| x == &h) {
+                hosts.push(h);
+            }
+        }
+    }
+    hosts
+}
+
+fn forge_for(host: &str, gh_hosts: &[String]) -> Forge {
+    let h = host.to_ascii_lowercase();
+    if h == "github.com" {
+        return Forge::Github;
+    }
+    // Authenticated against it with gh => it is a GitHub, whatever it is called.
+    if gh_hosts.iter().any(|x| x.eq_ignore_ascii_case(&h)) {
+        return Forge::GithubEnterprise;
+    }
+    if h.contains("gitlab") {
+        return Forge::Gitlab;
+    }
+    if h.contains("gitea") || h.contains("forgejo") || h == "codeberg.org" {
+        return Forge::Gitea;
+    }
+    if h.contains("github") {
+        return Forge::GithubEnterprise;
+    }
+    Forge::Unknown
+}
+
+/// Host of a bare `owner/repo`. `GH_HOST` is the gh-native switch: set it and a
+/// bare slug means your enterprise GitHub, exactly as it does for `gh` itself.
+fn default_host() -> String {
+    let h = env::var("GH_HOST").unwrap_or_default();
+    let h = h.trim();
+    if h.is_empty() {
+        "github.com".to_string()
+    } else {
+        h.to_string()
+    }
+}
+
+fn valid_host(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 253
+        && !h.starts_with('-')
+        && !h.ends_with('-')
+        && h.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// Split a reference into (host, "owner/repo"). `None` = no host present, so the
+/// caller supplies the default. Covers `https://`, `http://`, `ssh://`, `git://`,
+/// scp-like `git@host:o/r`, and bare `host/owner/repo` — a dot in the first
+/// segment is what marks a segment as a host rather than an owner.
+fn split_host(s: &str) -> Option<(String, String)> {
+    for scheme in ["https://", "http://", "ssh://", "git://"] {
+        if let Some(rest) = s.strip_prefix(scheme) {
+            let rest = match rest.rsplit_once('@') {
+                Some((_, after)) => after,
+                None => rest,
+            };
+            let (h, r) = rest.split_once('/')?;
+            let h = h.split(':').next().unwrap_or(h); // drop :port, https clone needs none
+            if h.is_empty() || r.is_empty() {
+                return None;
+            }
+            return Some((h.to_string(), r.to_string()));
+        }
+    }
+    if let Some(at) = s.find('@') {
+        let after = &s[at + 1..];
+        let (h, r) = after.split_once(':')?;
+        if h.contains('.') && !r.is_empty() && !r.starts_with('/') {
+            return Some((h.to_string(), r.to_string()));
+        }
+        return None;
+    }
+    let segs: Vec<&str> = s.split('/').collect();
+    if segs.len() >= 3 && segs[0].contains('.') {
+        return Some((segs[0].to_string(), segs[1..].join("/")));
+    }
+    None
+}
+
+/// Parse any of: `owner/repo`, `host/owner/repo`, `https://host/o/r[.git]`,
+/// `ssh://git@host/o/r.git`, `git@host:o/r.git`. Every segment is checked with
+/// `valid_name`, so traversal, empty segments and forge-invalid names are rejected
+/// before `rp clone` can turn a typo into a write outside the cache.
+fn parse_repo(raw: &str, gh_hosts: &[String]) -> Result<Repo, String> {
+    let s = raw.trim().trim_matches('/');
+    if s.is_empty() {
+        return Err(format!("empty repo reference: {raw:?} (want owner/repo)"));
+    }
+    // `.git` is transport noise: strip it for parsing, keep it in the clone URL.
+    let no_git = s.strip_suffix(".git").unwrap_or(s);
+    // A dotted first segment with nothing after the repo is `host/repo`, which is
+    // not a shape any forge has. Better a clear error than github.com/gitlab.com/x.
+    let bare = !no_git.contains("://") && !no_git.contains('@');
+    let shape: Vec<&str> = no_git.split('/').collect();
+    if bare && shape.len() == 2 && shape[0].contains('.') {
+        return Err(format!("want host/owner/repo, got {raw:?}"));
+    }
+    let (host, rest) = match split_host(no_git) {
+        Some(hr) => hr,
+        None => (default_host(), no_git.to_string()),
+    };
+    // "transport" means the reference named its own protocol: a scheme, or the
+    // scp-style `user@host:`. A bare `host/owner/repo` does not — it gets https.
+    let transport = no_git.contains("://") || no_git.contains('@');
+    if !valid_host(&host) {
+        return Err(format!("invalid host in {raw:?}: {host}"));
+    }
+    let segs: Vec<&str> = rest.split('/').collect();
+    if segs.len() < 2 {
+        return Err(format!("want owner/repo or host/owner/repo, got {raw:?}"));
+    }
+    if !segs.iter().all(|p| valid_name(p)) {
+        return Err(format!("invalid repo slug in {raw:?}"));
+    }
+    let forge = forge_for(&host, gh_hosts);
+    // GitHub has no nested groups: anything but exactly owner/repo is a typo there.
+    // GitLab subgroups and Gitea org trees may nest, so only GitHub is strict.
+    if matches!(forge, Forge::Github | Forge::GithubEnterprise) && segs.len() != 2 {
+        return Err(format!("{host} repos are owner/repo, got {raw:?}"));
+    }
+    // GitLab nested subgroups: everything above the repo name is the owner.
+    let name = segs[segs.len() - 1].to_string();
+    let owner = segs[..segs.len() - 1].join("/");
+    // A reference that arrived with its own transport keeps it verbatim: an
+    // scp-style URL clones over ssh with the user's keys, an https one over https.
+    let url = if transport {
+        s.to_string()
+    } else {
+        format!("https://{host}/{owner}/{name}")
+    };
+    let forge = forge_for(&host, gh_hosts);
+    Ok(Repo {
+        host,
+        owner,
+        name,
+        forge,
+        url,
+    })
+}
+
+/// The origin URL recorded in a clone, or None if it is not a git dir.
+fn origin_of(dir: &Path) -> Option<String> {
+    let (rc, o) = run(
+        "git",
+        &[
+            "-C",
+            &dir.to_string_lossy(),
+            "config",
+            "--get",
+            "remote.origin.url",
+        ],
+    );
+    if rc == 0 && !o.trim().is_empty() {
+        Some(o.trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// `https://host/o/r`, `https://host/o/r.git` and `git@host:o/r.git` are one
+/// origin. Normalised so a clone made over ssh matches a lookup made over https.
+fn norm_origin(u: &str) -> String {
+    let mut s = u.trim().trim_end_matches('/').to_string();
+    for sc in ["https://", "http://", "ssh://", "git://"] {
+        if let Some(r) = s.strip_prefix(sc) {
+            s = r.to_string();
+        }
+    }
+    if let Some((_, after)) = s.split_once('@') {
+        s = after.to_string();
+    }
+    if let Some(i) = s.find(':') {
+        let (h, r) = (&s[..i], &s[i + 1..]);
+        if !h.contains('/') && r.contains('/') {
+            s = format!("{h}/{r}");
+        }
+    }
+    if let Some(r) = s.strip_suffix(".git") {
+        s = r.to_string();
+    }
+    s.to_ascii_lowercase()
+}
+
+/// Cache directory for a repo. Prefers the bare repo name so clones made before rp
+/// grew host-aware are still found; falls back to `host-owner-repo` when the bare
+/// name is already taken by a *different* remote. Without this, `github.com/a/cli`
+/// and `gitlab.com/a/cli` would fight over one directory.
+fn cache_dir_for(c: &Cfg, repo: &Repo) -> PathBuf {
+    let bare = c.cache.join(&repo.name);
+    if !bare.join(".git").exists() {
+        return bare;
+    }
+    match origin_of(&bare) {
+        Some(o) if norm_origin(&o) == norm_origin(&repo.url) => bare,
+        _ => c
+            .cache
+            .join(format!("{}-{}-{}", repo.host, repo.owner, repo.name)),
+    }
+}
+
+/// Clone-free commands for this forge, cheapest first.
+fn remote_cmds(repo: &Repo) -> Vec<(&'static str, String)> {
+    let slug = repo.slug();
+    let host = repo.host.as_str();
+    match repo.forge {
+        Forge::Github => vec![
+            (
+                "search",
+                format!("gh search code 'PATTERN' --repo {slug} --limit 20"),
+            ),
+            (
+                "tree",
+                format!("gh api repos/{slug}/git/trees/HEAD?recursive=1 --jq '.tree[].path'"),
+            ),
+            (
+                "file",
+                format!("gh api repos/{slug}/contents/PATH --jq .content | base64 -d"),
+            ),
+        ],
+        // Same CLI, different host. `gh` resolves /api/v3 and the keyring itself
+        // from GH_HOST, so enterprise costs rp nothing but a prefix.
+        Forge::GithubEnterprise => {
+            let e = format!("GH_HOST={host} ");
+            vec![
+                (
+                    "search",
+                    format!("{e}gh search code 'PATTERN' --repo {slug} --limit 20"),
+                ),
+                (
+                    "tree",
+                    format!(
+                        "{e}gh api repos/{slug}/git/trees/HEAD?recursive=1 --jq '.tree[].path'"
+                    ),
+                ),
+                (
+                    "file",
+                    format!("{e}gh api repos/{slug}/contents/PATH --jq .content | base64 -d"),
+                ),
+            ]
+        }
+        Forge::Gitlab => {
+            let id = repo.id_enc();
+            // The header must vanish when the token is unset: GitLab answers an
+            // empty `PRIVATE-TOKEN:` with a 302 to sign_in, but the same call
+            // with no header at all returns the public repo.
+            let tok = "${GITLAB_TOKEN:+-H \"PRIVATE-TOKEN: $GITLAB_TOKEN\"}";
+            vec![
+                (
+                    "search",
+                    format!(
+                        "curl -s {tok} \"https://{host}/api/v4/projects/{id}/search?scope=blobs&search=PATTERN\""
+                    ),
+                ),
+                (
+                    "tree",
+                    format!(
+                        "curl -s {tok} \"https://{host}/api/v4/projects/{id}/repository/tree?recursive=true&per_page=1000\""
+                    ),
+                ),
+                (
+                    "file",
+                    format!(
+                        "curl -s {tok} \"https://{host}/api/v4/projects/{id}/repository/files/PATH_URL_ENCODED/raw?ref=HEAD\""
+                    ),
+                ),
+            ]
+        }
+        Forge::Gitea => {
+            let tok = "${GITEA_TOKEN:+-H \"Authorization: token $GITEA_TOKEN\"}";
+            vec![
+                (
+                    "search",
+                    format!(
+                        "curl -s {tok} \"https://{host}/api/v1/search/code?q=repo:{slug}+PATTERN\""
+                    ),
+                ),
+                (
+                    "tree",
+                    format!(
+                        "curl -s {tok} \"https://{host}/api/v1/repos/{slug}/git/trees/HEAD?recursive=true\""
+                    ),
+                ),
+                (
+                    "file",
+                    format!("curl -s {tok} \"https://{host}/api/v1/repos/{slug}/raw/HEAD/PATH\""),
+                ),
+            ]
+        },
+        // No forge API: the git-native floor is all there is, and it is enough.
+        Forge::Unknown => {
+            let tmp = format!("/tmp/rp-{}-{}", repo.owner, repo.name);
+            vec![
+                ("refs", format!("git ls-remote --symref {} HEAD", repo.url)),
+                (
+                    "tree",
+                    format!(
+                        "git clone --depth 1 --filter=blob:none --no-checkout {} {tmp} && git -C {tmp} ls-tree -r --name-only HEAD",
+                        repo.url
+                    ),
+                ),
+                (
+                    "file",
+                    format!("git archive --remote={} HEAD PATH | tar -x", repo.url),
+                ),
+            ]
+        }
+    }
+}
+
+/// The no-token, zero-byte floor. Works on every forge, so R0 never dies.
+fn git_floor(repo: &Repo) -> String {
+    format!("git ls-remote --symref {} HEAD", repo.url)
+}
+
+fn remote_notes(repo: &Repo) -> Vec<String> {
+    match repo.forge {
+        Forge::Github => {
+            vec!["search cap is 30/min — batch queries, never loop per file".to_string()]
+        }
+        Forge::GithubEnterprise => vec![
+            format!(
+                "needs `gh auth login --hostname {}` first; gh speaks /api/v3 there so you never touch it",
+                repo.host
+            ),
+            "site admins can disable code search — if `gh search` 404s, drop to the git floor"
+                .to_string(),
+        ],
+        Forge::Gitlab => vec![
+            "tree and raw files are open on public repos with no token at all".to_string(),
+            "code search needs $GITLAB_TOKEN with scope read_api — anonymous blob search is 401"
+                .to_string(),
+            "never send the header empty: GitLab 302s it to sign_in, which is why the commands above use ${VAR:+…}"
+                .to_string(),
+        ],
+        Forge::Gitea => vec![
+            "tree and raw files are open on public repos with no token at all".to_string(),
+            "code search needs $GITEA_TOKEN (or $FORGEJO_TOKEN) *and* a server with the repo indexer on — a 404 means this forge cannot search, use the git floor"
+                .to_string(),
+        ],
+        Forge::Unknown => vec![
+            format!("no forge API known for {} — git-native floor only", repo.host),
+            "`git archive --remote` works on GitLab/Gitea, NOT on GitHub".to_string(),
+            "ls-remote on a repo with a huge ref history can take 20s+ — always name HEAD, never list all refs"
+                .to_string(),
+        ],
+    }
 }
 
 fn valid_name(p: &str) -> bool {
@@ -322,13 +729,6 @@ fn valid_name(p: &str) -> bool {
         && !p.starts_with(".git")
         && p.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
-
-/// Exactly `owner/repo`. Rejects traversal, empty segments and forge-invalid names,
-/// so a typo cannot turn `rp clone` into a write outside the cache.
-fn valid_slug(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('/').collect();
-    parts.len() == 2 && parts.iter().all(|p| valid_name(p))
 }
 
 /// Repo-relative sparse path: no absolute paths, no `..`, no NUL.
@@ -664,60 +1064,59 @@ fn cmd_gc(c: &Cfg) {
 }
 
 fn cmd_get(c: &Cfg, raw: &str) {
-    let slug = norm_slug(raw);
-    if !valid_slug(&slug) {
-        die_input(&format!("invalid repo slug: {raw} (want owner/repo)"));
-    }
-    let dest = c.cache.join(base(&slug));
+    let repo = match parse_repo(raw, &gh_auth_hosts()) {
+        Ok(r) => r,
+        Err(e) => die_input(&e),
+    };
+    let slug = repo.key();
+    let dest = cache_dir_for(c, &repo);
     if dest.join(".git").exists() {
         return cmd_state(c, &dest.to_string_lossy());
     }
     record(c, &format!("remote:{slug}"));
-    let cmds = [
-        (
-            "search",
-            format!("gh search code 'PATTERN' --repo {slug} --limit 20"),
-        ),
-        (
-            "tree",
-            format!("gh api repos/{slug}/git/trees/HEAD?recursive=1 --jq '.tree[].path'"),
-        ),
-        (
-            "file",
-            format!("gh api repos/{slug}/contents/PATH --jq .content | base64 -d"),
-        ),
-    ];
+    let cmds = remote_cmds(&repo);
+    let floor = git_floor(&repo);
+    let clone_hint = format!("rp clone {slug} [subpath]");
+    let mut notes = remote_notes(&repo);
+    notes.push(format!(
+        "clone only when you will grep more than ~5 times: {clone_hint}"
+    ));
     if json_on() {
         let cjson: Vec<String> = cmds
             .iter()
             .map(|(k, v)| format!("{}:{}", jstr(k), jstr(v)))
             .collect();
         println!(
-            "{{\"repo\":{},\"tier\":\"R0\",\"cloned\":false,\"commands\":{{{}}},\"notes\":{}}}",
+            "{{\"repo\":{},\"host\":{},\"forge\":{},\"url\":{},\"tier\":\"R0\",\"cloned\":false,\"commands\":{{{}}},\"floor\":{},\"notes\":{}}}",
             jstr(&slug),
+            jstr(&repo.host),
+            jstr(repo.forge.label()),
+            jstr(&repo.url),
             cjson.join(","),
-            jarr(&[
-                "search cap is 30/min — batch queries, never loop per file".into(),
-                format!(
-                    "clone only when you will grep more than ~5 times: rp clone {slug} [subpath]"
-                ),
-            ])
+            jstr(&floor),
+            jarr(&notes)
         );
         return;
     }
-    println!("repo: {slug}  tier: R0 remote — NOT cloned (a clone costs 50-460 MB and 10-40s)");
+    println!(
+        "repo: {slug}  forge: {}  tier: R0 remote — NOT cloned (a clone costs 50-460 MB and 10-40s)",
+        repo.forge.label()
+    );
     for (k, v) in &cmds {
         println!("  {k}: {v}");
     }
-    println!("  search cap is 30/min — batch queries, never loop per file");
-    println!("  clone only when you will grep more than ~5 times: rp clone {slug} [subpath]");
+    println!("  floor (no token, 0 MB): {floor}");
+    for n in &notes {
+        println!("  note: {n}");
+    }
 }
 
 fn cmd_clone(c: &Cfg, raw: &str, sub: Option<&str>) {
-    let slug = norm_slug(raw);
-    if !valid_slug(&slug) {
-        die_input(&format!("invalid repo slug: {raw} (want owner/repo)"));
-    }
+    let repo = match parse_repo(raw, &gh_auth_hosts()) {
+        Ok(r) => r,
+        Err(e) => die_input(&e),
+    };
+    let slug = repo.key();
     if let Some(sp) = sub {
         if !valid_subpath(sp) {
             die_input(&format!(
@@ -725,7 +1124,7 @@ fn cmd_clone(c: &Cfg, raw: &str, sub: Option<&str>) {
             ));
         }
     }
-    let dest = c.cache.join(base(&slug));
+    let dest = cache_dir_for(c, &repo);
     let ds = dest.to_string_lossy().into_owned();
     if dest.join(".git").exists() {
         say(format!("rp: already cloned at {ds}"));
@@ -739,13 +1138,26 @@ fn cmd_clone(c: &Cfg, raw: &str, sub: Option<&str>) {
         ));
         evict(c);
     }
-    let url = format!("https://github.com/{slug}");
+    let url = repo.url.clone();
     match sub {
         Some(sp) => {
             say(format!(
                 "rp: sparse clone {slug} -> only '{sp}' (cheapest by far on monorepos)"
             ));
-            let (rc, o) = run("git", &["clone", "--depth", "1", "--sparse", &url, &ds]);
+            // blob:none keeps the fetch trees-only: the cone's blobs arrive at checkout,
+            // everything else stays remote and lazy-fetches if a history read needs it.
+            let (rc, o) = run(
+                "git",
+                &[
+                    "clone",
+                    "--depth",
+                    "1",
+                    "--filter=blob:none",
+                    "--sparse",
+                    &url,
+                    &ds,
+                ],
+            );
             if rc != 0 {
                 eprintln!("rp: clone failed\n{}", tail(&o, 3));
                 exit(1);
@@ -1411,7 +1823,9 @@ fn status_of(rows: &[(&'static str, &'static str, String, &'static str)], name: 
 /// Which tiers this box can actually serve, given what is installed.
 fn live_tiers(rows: &[(&'static str, &'static str, String, &'static str)]) -> Vec<&'static str> {
     let mut v = vec!["T0"];
-    if status_of(rows, "gh cli") && status_of(rows, "gh auth") {
+    // R0 never dies: `git ls-remote` is a zero-byte remote query against every
+    // forge, so git alone serves it. The forge APIs only buy code *search* on top.
+    if status_of(rows, "git") {
         v.push("R0");
     }
     if status_of(rows, "git") {
@@ -1431,8 +1845,8 @@ fn missing_tiers(
     rows: &[(&'static str, &'static str, String, &'static str)],
 ) -> Vec<(&'static str, &'static str)> {
     let mut m = Vec::new();
-    if !(status_of(rows, "gh cli") && status_of(rows, "gh auth")) {
-        m.push(("R0", "install gh, then run: gh auth login"));
+    if !status_of(rows, "git") {
+        m.push(("R0", "install git — without it there is no remote floor at all"));
     }
     if !status_of(rows, "git") {
         m.push(("R1", "install git"));
@@ -1447,6 +1861,45 @@ fn missing_tiers(
         ));
     }
     m
+}
+
+/// Per-forge: can rp actually search this box's remotes, right now. The git floor
+/// is always live; what varies is the code-search API on top of it.
+fn forge_search_report(
+    rows: &[(&'static str, &'static str, String, &'static str)],
+) -> String {
+    let gh = status_of(rows, "gh cli") && status_of(rows, "gh auth");
+    let curl = status_of(rows, "curl");
+    let gl_tok = !env::var("GITLAB_TOKEN").unwrap_or_default().trim().is_empty();
+    let gt_tok = !env::var("GITEA_TOKEN")
+        .or_else(|_| env::var("FORGEJO_TOKEN"))
+        .unwrap_or_default()
+        .trim()
+        .is_empty();
+    let ent = gh_auth_hosts().iter().any(|h| h != "github.com");
+    format!(
+        "github {} · enterprise {} · gitlab {} · gitea {} · unknown hosts: git floor only",
+        if gh { "ok" } else { "NO (gh not authed)" },
+        if ent {
+            "ok"
+        } else {
+            "NO (gh auth login --hostname <host>)"
+        },
+        if !curl {
+            "NO (curl missing)"
+        } else if gl_tok {
+            "ok"
+        } else {
+            "public only (no $GITLAB_TOKEN)"
+        },
+        if !curl {
+            "NO (curl missing)"
+        } else if gt_tok {
+            "ok"
+        } else {
+            "tree/raw only (no $GITEA_TOKEN)"
+        }
+    )
 }
 
 fn cmd_doctor(c: &Cfg) {
@@ -1477,8 +1930,67 @@ fn cmd_doctor(c: &Cfg) {
         rc,
         &o,
         false,
-        "gh auth login  (without it R0 remote queries are dead)",
+        "gh auth login  (without it GitHub / GitHub Enterprise R0 search is dead; the git floor still works)",
     );
+    let (rc, o) = run("curl", &["--version"]);
+    push_row(
+        &mut rows,
+        "curl",
+        rc,
+        &o,
+        true,
+        "install curl: GitLab and Gitea/Forgejo R0 are plain REST",
+    );
+    let (rc, o) = run("glab", &["--version"]);
+    push_row(
+        &mut rows,
+        "glab cli",
+        rc,
+        &o,
+        true,
+        "optional: rp's GitLab R0 uses curl + $GITLAB_TOKEN either way",
+    );
+    let gl_tok = env::var("GITLAB_TOKEN").unwrap_or_default();
+    rows.push((
+        "$GITLAB_TOKEN",
+        if gl_tok.trim().is_empty() { "warn" } else { "ok" },
+        if gl_tok.trim().is_empty() {
+            "unset — private GitLab search is off".to_string()
+        } else {
+            "set — private GitLab search is on".to_string()
+        },
+        "export GITLAB_TOKEN=<pat with scope read_api>",
+    ));
+    let gt_tok = env::var("GITEA_TOKEN")
+        .or_else(|_| env::var("FORGEJO_TOKEN"))
+        .unwrap_or_default();
+    rows.push((
+        "$GITEA_TOKEN",
+        if gt_tok.trim().is_empty() { "warn" } else { "ok" },
+        if gt_tok.trim().is_empty() {
+            "unset — Gitea/Forgejo code search is off".to_string()
+        } else {
+            "set — Gitea/Forgejo code search is on".to_string()
+        },
+        "export GITEA_TOKEN=<access token> (or FORGEJO_TOKEN)",
+    ));
+    let hosts = gh_auth_hosts();
+    rows.push((
+        "gh hosts",
+        if hosts.is_empty() { "warn" } else { "ok" },
+        if hosts.is_empty() {
+            "none".to_string()
+        } else {
+            hosts.join(", ")
+        },
+        "gh auth login --hostname github.corp.example  (one gh login per enterprise host)",
+    ));
+    rows.push((
+        "R0 forge search",
+        "warn",
+        forge_search_report(&rows),
+        "",
+    ));
     let (rc, o) = run("graphicle", &["--version"]);
     push_row(
         &mut rows,
@@ -1765,13 +2277,109 @@ mod tests {
     }
 
     #[test]
-    fn slug_normalisation_strips_transport() {
-        use super::norm_slug;
+    fn bare_slug_is_github() {
+        use super::{parse_repo, Forge};
+        let r = parse_repo("pallets/click", &[]).unwrap();
+        assert_eq!(r.host, "github.com");
+        assert_eq!(r.slug(), "pallets/click");
+        assert_eq!(r.forge, Forge::Github);
+        assert_eq!(r.url, "https://github.com/pallets/click");
+    }
+
+    #[test]
+    fn transport_forms_land_on_one_repo() {
+        use super::parse_repo;
+        let want = parse_repo("pallets/click", &[]).unwrap();
+        for form in [
+            "https://github.com/pallets/click.git",
+            "git@github.com:pallets/click",
+            "github.com/pallets/click",
+            "  https://github.com/pallets/click/  ",
+        ] {
+            let got = parse_repo(form, &[]).unwrap();
+            assert_eq!(got.host, want.host, "{form}");
+            assert_eq!(got.slug(), want.slug(), "{form}");
+        }
+    }
+
+    #[test]
+    fn enterprise_github_is_known_from_gh_not_guessed() {
+        use super::{parse_repo, Forge};
+        let hosts = vec!["github.com".to_string(), "github.acme.io".to_string()];
+        let r = parse_repo("github.acme.io/acme/widget", &hosts).unwrap();
+        assert_eq!(r.forge, Forge::GithubEnterprise);
+        assert_eq!(r.key(), "github.acme.io/acme/widget");
+    }
+
+    #[test]
+    fn other_forges_route_to_their_own_api() {
+        use super::{parse_repo, Forge};
         assert_eq!(
-            norm_slug("https://github.com/pallets/click.git"),
-            "pallets/click"
+            parse_repo("gitlab.com/foo/bar", &[]).unwrap().forge,
+            Forge::Gitlab
         );
-        assert_eq!(norm_slug("git@github.com:pallets/click"), "pallets/click");
-        assert_eq!(norm_slug("  pallets/click/  "), "pallets/click");
+        assert_eq!(
+            parse_repo("codeberg.org/foo/bar", &[]).unwrap().forge,
+            Forge::Gitea
+        );
+        assert_eq!(
+            parse_repo("git.self-hosted.io/foo/bar", &[]).unwrap().forge,
+            Forge::Unknown
+        );
+    }
+
+    #[test]
+    fn ssh_urls_keep_their_transport_for_the_clone() {
+        use super::parse_repo;
+        let r = parse_repo("ssh://git@gitlab.com/foo/bar.git", &[]).unwrap();
+        assert_eq!(r.host, "gitlab.com");
+        assert_eq!(r.url, "ssh://git@gitlab.com/foo/bar.git");
+    }
+
+    #[test]
+    fn two_forges_same_owner_repo_never_share_a_key() {
+        use super::parse_repo;
+        let g = parse_repo("github.com/a/cli", &[]).unwrap();
+        let l = parse_repo("gitlab.com/a/cli", &[]).unwrap();
+        assert_eq!(g.name, l.name);
+        assert_ne!(g.key(), l.key());
+    }
+
+    #[test]
+    fn bad_references_are_rejected() {
+        use super::parse_repo;
+        assert!(parse_repo("", &[]).is_err());
+        assert!(parse_repo("only-one-segment", &[]).is_err());
+        assert!(parse_repo("../evil", &[]).is_err());
+        assert!(parse_repo("owner/../repo", &[]).is_err());
+        // host/repo is not a shape any forge has; do not silently make it github's.
+        assert!(parse_repo("gitlab.com/onlyone", &[]).is_err());
+    }
+
+    #[test]
+    fn gitlab_nested_subgroups_stay_one_repo() {
+        use super::parse_repo;
+        let r = parse_repo("gitlab.com/grp/sub/proj", &[]).unwrap();
+        assert_eq!(r.host, "gitlab.com");
+        assert_eq!(r.owner, "grp/sub");
+        assert_eq!(r.name, "proj");
+        assert_eq!(r.id_enc(), "grp%2Fsub%2Fproj");
+    }
+
+    #[test]
+    fn origin_normalisation_unifies_ssh_and_https() {
+        use super::norm_origin;
+        assert_eq!(
+            norm_origin("git@github.com:a/b.git"),
+            norm_origin("https://github.com/a/b")
+        );
+        assert_eq!(
+            norm_origin("https://github.com/a/b/"),
+            norm_origin("https://github.com/a/b.git")
+        );
+        assert_ne!(
+            norm_origin("https://github.com/a/b"),
+            norm_origin("https://gitlab.com/a/b")
+        );
     }
 }

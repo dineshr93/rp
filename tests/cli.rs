@@ -50,11 +50,13 @@ impl Env {
 dir=""
 if [ "$1" = "-C" ]; then dir="$2"; shift 2; fi
 last=""
-for a in "$@"; do last="$a"; done
+prev=""
+for a in "$@"; do prev="$last"; last="$a"; done
 case "$1" in
   rev-parse) echo "$dir" ;;
   status)    [ -n "$FAKE_DIRTY" ] && echo " M local-change.txt" ;;
-  clone)     mkdir -p "$last/.git" && echo "fake cloned $last" ;;
+  config)    cat "$dir/.git/ORIGIN" 2>/dev/null ;;
+  clone)     mkdir -p "$last/.git" && echo "$prev" > "$last/.git/ORIGIN" && echo "fake cloned $last from $prev" ;;
   sparse-checkout) echo "fake sparse set" ;;
   *) exit 0 ;;
 esac
@@ -96,10 +98,22 @@ esac
 case "$1 $2" in
   "--version "*) echo "gh version stub"; exit 0 ;;
   "auth status") [ -n "$FAKE_NO_AUTH" ] && { echo "not logged in" >&2; exit 1; }
-                echo "github.com"; exit 0 ;;
+                echo "github.com"
+                echo "  * Logged in to github.com account stub (keyring)"
+                if [ -n "$FAKE_GH_ENT" ]; then
+                  echo "$FAKE_GH_ENT"
+                  echo "  * Logged in to $FAKE_GH_ENT account stub (keyring)"
+                fi
+                exit 0 ;;
   *) exit 0 ;;
 esac
 "#,
+        );
+
+        stub(
+            &bin,
+            "curl",
+            "echo 'curl stub 8.5.0'\nexit 0",
         );
 
         // node: the context-mode CLI stand-in.
@@ -112,10 +126,10 @@ esac
         Env { tmp, bin, repo }
     }
 
-    fn cmd(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_rp"))
-            .args(args)
-            .current_dir(&self.repo)
+    /// The hermetic environment every rp invocation runs under.
+    fn base(&self) -> Command {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_rp"));
+        c.current_dir(&self.repo)
             // HOME is redirected so agent_targets() can never reach the real box.
             .env("HOME", &self.tmp)
             .env(
@@ -133,9 +147,29 @@ esac
             .env("CTX_MODE_CLI", self.tmp.join("ctx.bundle.mjs"))
             .env("RP_CACHE_GB", "150")
             .env("RP_FREE_FLOOR_GB", "0")
-            .env("RP_BUDGET_MB", "4096")
-            .output()
-            .expect("rp failed to spawn")
+            .env("RP_BUDGET_MB", "4096");
+        // Forge routing must not depend on whatever the developer happens to export.
+        for k in ["GH_HOST", "GITLAB_TOKEN", "GITEA_TOKEN", "FORGEJO_TOKEN"] {
+            c.env_remove(k);
+        }
+        c
+    }
+
+    fn cmd(&self, args: &[&str]) -> Output {
+        self.base().args(args).output().expect("rp failed to spawn")
+    }
+
+    /// `cmd` plus extra environment variables, for the forge-routing tests.
+    fn cmd_extra(&self, args: &[&str], extra: &[(&str, &str)]) -> Output {
+        let mut c = self.base();
+        for (k, v) in extra {
+            c.env(k, v);
+        }
+        c.args(args).output().expect("rp failed to spawn")
+    }
+
+    fn out_extra(&self, args: &[&str], extra: &[(&str, &str)]) -> String {
+        String::from_utf8_lossy(&self.cmd_extra(args, extra).stdout).into_owned()
     }
 
     fn out(&self, args: &[&str]) -> String {
@@ -342,6 +376,129 @@ fn traversal_subpath_is_rejected() {
         let o = e.cmd(&["clone", "pallets/click", bad]);
         assert_eq!(o.status.code(), Some(2), "expected exit 2 for {bad:?}");
     }
+}
+
+#[test]
+fn a_gitlab_repo_routes_to_the_gitlab_api_not_gh() {
+    let e = Env::new("gitlab");
+    let s = e.out(&["get", "gitlab.com/gitlab-org/cli"]);
+    assert!(s.contains("forge: gitlab"), "{s}");
+    assert!(s.contains("/api/v4/projects/gitlab-org%2Fcli"), "{s}");
+    assert!(!s.contains("gh search"), "must not hand back gh for gitlab: {s}");
+    assert!(s.contains("git ls-remote --symref"), "{s}");
+    assert!(
+        !e.tmp.join("cache/cli/.git").exists(),
+        "get must never clone: {s}"
+    );
+}
+
+#[test]
+fn a_gitea_host_routes_to_the_gitea_api() {
+    let e = Env::new("gitea");
+    let s = e.out(&["get", "codeberg.org/forgejo/forgejo"]);
+    assert!(s.contains("forge: gitea"), "{s}");
+    assert!(s.contains("/api/v1/repos/forgejo/forgejo"), "{s}");
+}
+
+#[test]
+fn an_enterprise_github_host_gets_the_gh_host_prefix() {
+    let e = Env::new("ghe");
+    let s = e.out_extra(
+        &["get", "github.acme.io/acme/widget"],
+        &[("FAKE_GH_ENT", "github.acme.io")],
+    );
+    assert!(s.contains("forge: github-enterprise"), "{s}");
+    assert!(s.contains("GH_HOST=github.acme.io gh"), "{s}");
+}
+
+#[test]
+fn gh_host_env_makes_a_bare_slug_enterprise() {
+    let e = Env::new("ghhostenv");
+    let s = e.out_extra(
+        &["get", "acme/widget"],
+        &[
+            ("GH_HOST", "github.acme.io"),
+            ("FAKE_GH_ENT", "github.acme.io"),
+        ],
+    );
+    assert!(s.contains("repo: github.acme.io/acme/widget"), "{s}");
+    assert!(s.contains("forge: github-enterprise"), "{s}");
+}
+
+#[test]
+fn an_unknown_host_falls_to_the_git_floor() {
+    let e = Env::new("unknownforge");
+    let s = e.out(&["get", "git.self-hosted.io/a/b"]);
+    assert!(s.contains("forge: unknown"), "{s}");
+    assert!(
+        s.contains("floor (no token, 0 MB): git ls-remote --symref https://git.self-hosted.io/a/b HEAD"),
+        "{s}"
+    );
+}
+
+#[test]
+fn clone_uses_the_url_it_was_given_not_github() {
+    let e = Env::new("cloneurl");
+    let o = e.cmd(&["clone", "gitlab.com/foo/bar"]);
+    assert!(o.status.success(), "{}", stdout_of(&o));
+    let origin = fs::read_to_string(e.tmp.join("cache/bar/.git/ORIGIN")).unwrap();
+    assert_eq!(origin.trim(), "https://gitlab.com/foo/bar");
+}
+
+#[test]
+fn two_forges_with_the_same_repo_name_get_two_directories() {
+    let e = Env::new("collide");
+    assert!(e
+        .cmd(&["clone", "github.com/a/cli"])
+        .status
+        .success());
+    assert!(e
+        .cmd(&["clone", "gitlab.com/a/cli"])
+        .status
+        .success());
+    let bare = e.tmp.join("cache/cli/.git/ORIGIN");
+    let ns = e.tmp.join("cache/gitlab.com-a-cli/.git/ORIGIN");
+    assert_eq!(fs::read_to_string(&bare).unwrap().trim(), "https://github.com/a/cli");
+    assert_eq!(fs::read_to_string(&ns).unwrap().trim(), "https://gitlab.com/a/cli");
+    // Re-cloning the first must reuse the bare dir, not make a third one.
+    assert!(e
+        .cmd(&["clone", "github.com/a/cli"])
+        .status
+        .success());
+    assert!(!e.tmp.join("cache/github.com-a-cli").exists());
+}
+
+#[test]
+fn ssh_reference_clones_over_ssh() {
+    let e = Env::new("sshclone");
+    let o = e.cmd(&["clone", "ssh://git@gitlab.com/foo/bar.git"]);
+    assert!(o.status.success(), "{}", stdout_of(&o));
+    let origin = fs::read_to_string(e.tmp.join("cache/bar/.git/ORIGIN")).unwrap();
+    assert_eq!(origin.trim(), "ssh://git@gitlab.com/foo/bar.git");
+}
+
+#[test]
+fn gitlab_and_gitea_commands_guard_the_token() {
+    let e = Env::new("tokenguard");
+    // An *empty* PRIVATE-TOKEN header makes GitLab 302 to sign_in, while the same
+    // call with no header returns the public repo. So the header must be
+    // conditional on the variable actually being set.
+    let s = e.out(&["get", "gitlab.com/foo/bar"]);
+    for line in s.lines().filter(|l| l.trim_start().starts_with("search:") || l.trim_start().starts_with("tree:") || l.trim_start().starts_with("file:")) {
+        assert!(line.contains("${GITLAB_TOKEN:+"), "unguarded token header: {line}");
+    }
+    let g = e.out(&["get", "gitea.example.com/foo/bar"]);
+    assert!(g.contains("${GITEA_TOKEN:+"), "{g}");
+}
+
+#[test]
+fn doctor_names_which_forges_can_be_searched() {
+    let e = Env::new("doctorforge");
+    let s = e.out(&["doctor"]);
+    assert!(s.contains("R0 forge search"), "{s}");
+    assert!(s.contains("gitlab"), "{s}");
+    assert!(s.contains("gitea"), "{s}");
+    assert!(s.contains("gh hosts"), "{s}");
 }
 
 #[test]

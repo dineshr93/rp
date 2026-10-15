@@ -2,6 +2,66 @@
 
 All notable changes to `rp` are documented here.
 
+## [1.3.0] - 2026-10-15
+
+### Added
+
+- **Every forge, not just github.com.** `rp get` and `rp clone` now route on the
+  host in the reference: `owner/repo` (github.com, or `GH_HOST`'s enterprise
+  GitHub), `host/owner/repo`, `https://`, `ssh://`, `git://` and scp-style
+  `git@host:o/r`. GitLab nested subgroups (`gitlab.com/grp/sub/proj`) parse into
+  one repo with a multi-segment owner and are `%2F`-encoded for the `:id` param.
+  Enterprise GitHub costs no new API code — `gh` resolves `/api/v3` and the
+  keyring itself from `GH_HOST`, so it is a prefix on the same command.
+- **A token-free floor under R0.** `git ls-remote --symref <url> HEAD` answers any
+  git host for 0 MB with no API, so R0 no longer dies when `gh` is missing and an
+  unknown host is still reachable. `rp get` prints it as the `floor:` line on every
+  forge. Measured: 0.75s Forgejo, 0.67s GitLab.
+- **Per-forge R0 commands.** GitHub (`gh`), GitHub Enterprise (`GH_HOST=… gh`),
+  GitLab REST v4 (`repository/tree`, `repository/files/…/raw`, `search?scope=blobs`)
+  and Gitea/Forgejo REST v1 (`/repos/…/git/trees`, `/raw/HEAD/PATH`,
+  `/search/code`). Verified against the live services: tree and raw files return
+  anonymously on both GitLab and Codeberg; blob search is 401 without a token.
+- **GitLab's empty-header trap is closed.** `curl -H "PRIVATE-TOKEN: "` against a
+  public project returns a 302 to `users/sign_in`; the same URL with the header
+  omitted returns JSON. Emitted commands use
+  `${GITLAB_TOKEN:+-H "PRIVATE-TOKEN: $GITLAB_TOKEN"}` so the header disappears
+  when the variable is unset.
+- **Host-qualified ledger keys and cache dirs.** `gitlab.com/a/cli` and
+  `github.com/a/cli` no longer share a visit count or a checkout. `cache_dir_for`
+  keeps the bare repo name when its recorded `remote.origin.url` matches, so clones
+  made before this change are still found, and falls back to `host-owner-repo`
+  otherwise.
+- `rp doctor` rows: `curl`, `glab cli`, `$GITLAB_TOKEN`, `$GITEA_TOKEN`,
+  `gh hosts` (every GitHub host `gh` is authed against, enterprise included) and
+  `R0 forge search`, a per-forge live/dead summary.
+
+### Changed
+
+- `rp doctor` no longer calls R0 dead without `gh`. The git floor means R0 is live
+  whenever `git` is; `gh`, `$GITLAB_TOKEN` and `$GITEA_TOKEN` only buy code
+  *search* on top, and that is what the new rows report.
+- A bare `host/repo` (two segments, dotted first segment) is now a hard error
+  instead of silently becoming `github.com/host/repo`.
+- GitHub-family hosts reject anything but exactly `owner/repo`; GitLab and Gitea
+  may nest. `rp clone a/b/c` is refused again rather than pointed at a github.com
+  path that cannot exist.
+- `rp clone` uses the URL it was given instead of rebuilding
+  `https://github.com/<slug>`. An `ssh://` or `git@host:` reference now clones
+  over ssh with the user's keys; a GitLab reference no longer clones github.com.
+
+### Changed
+
+- `rp clone owner/repo <subpath>` now passes `--filter=blob:none`. The sparse path
+  used to download every blob in the tip commit and then check out a fraction of it,
+  so 7 MB of the gitdir was bytes the cone never touches. Measured on
+  `morluto/rea` cone `src`: 33 MB -> 25 MB (gitdir 13 MB -> 6 MB), 4.2s.
+  Committing back is unaffected: the cone's base blobs arrive at checkout, so
+  `git diff` and `git commit` still work with the remote unreachable, and
+  `sparse-checkout add <dir>` lazy-fetches only that dir. Cost is history reads
+  outside the cone (`log -p`, `blame`, `diff <old-sha>`) now need the network.
+  The whole-tree branch is unchanged — a full checkout needs every blob anyway.
+
 ## [1.2.1] - 2026-10-15
 
 ### Fixed

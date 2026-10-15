@@ -17,6 +17,40 @@ Measured on a 7,800-file repo:
 
 At 1000 repos a day, whole-tree clones are 180 GB/day — dead in two and a half days on a 450 GB disk. Answer remotely first, clone on repeat work, let `rp` evict.
 
+## Every forge, not just github.com
+
+`rp` routes on the **host in the reference**. A bare `owner/repo` is github.com —
+or your enterprise GitHub when `GH_HOST` is set, exactly as `gh` reads it. Anything
+that arrives with a host keeps that host, so GitLab (including nested subgroups),
+Gitea/Forgejo and GitHub Enterprise route through the same ladder instead of being
+silently rewritten into a github.com clone.
+
+| reference | forge | R0 code search | R0 with no token at all |
+|---|---|---|---|
+| `pallets/click` | github | `gh search code` | `git ls-remote` |
+| `GH_HOST=github.acme.io` + `acme/widget` | github enterprise | `GH_HOST=github.acme.io gh search code` | `git ls-remote` |
+| `gitlab.com/grp/sub/proj` | gitlab | REST v4 `scope=blobs` (needs `$GITLAB_TOKEN`) | tree + raw file, anonymous |
+| `codeberg.org/forgejo/forgejo` | gitea / forgejo | REST v1 (needs `$GITEA_TOKEN` **and** a server indexer) | tree + raw file, anonymous |
+| `git.self-hosted.io/a/b` | unknown | none | `ls-remote`, blobless tree, `git archive` |
+
+Measured 2026-10 against the real services, using the exact commands `rp get` emits:
+
+| call | latency | disk |
+|---|---|---|
+| `git ls-remote --symref <forgejo url> HEAD` | 0.75s | 0 MB |
+| `git ls-remote --symref <gitlab url> HEAD` | 0.67s | 0 MB |
+| `curl …/api/v4/projects/<id>/repository/tree` (anon) | 0.36s | 0 MB |
+| `curl …/api/v1/repos/<slug>/raw/HEAD/README.md` (anon) | 0.17s | 0 MB |
+| `curl …/api/v4/projects/<id>/search?scope=blobs` (anon) | 0.24s | 401 — token required |
+
+**The git floor is why R0 never dies.** `git ls-remote` answers any git host for
+zero bytes with no API and no credential beyond what git already has, so a forge rp
+has never heard of is still reachable. What a forge API buys on top is *code
+search* — nothing more.
+
+Enterprise GitHub costs rp no new code: `gh` resolves `/api/v3` and the keyring
+itself from `GH_HOST`, so the whole thing is a prefix on the same command.
+
 [![ci](https://github.com/dineshr93/rp/actions/workflows/ci.yml/badge.svg)](https://github.com/dineshr93/rp/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![zero dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen)](Cargo.toml)
@@ -40,7 +74,10 @@ hand-edited notes survive. `rp uninstall` reverses it.
 | tier | needs | install | check |
 |---|---|---|---|
 | **T0** grep, ledger, budget | `git` | any package manager | `rp state` |
-| **R0** remote query | `gh`, authenticated | `apt install gh` / `brew install gh`, then `gh auth login` (token needs `repo` scope) | `rp doctor` → `gh auth  ok` |
+| **R0** remote, git floor | `git` | as above — `ls-remote` answers every forge | `rp get <repo>` → `floor:` line |
+| **R0** github + GHE search | `gh`, authenticated | `apt install gh` / `brew install gh`, then `gh auth login` (`repo` scope); one login per enterprise host: `gh auth login --hostname github.acme.io` | `rp doctor` → `gh hosts` |
+| **R0** gitlab search | `curl` + `$GITLAB_TOKEN` | PAT with scope `read_api` | `rp doctor` → `$GITLAB_TOKEN` |
+| **R0** gitea/forgejo search | `curl` + `$GITEA_TOKEN` | access token; the server must have its repo indexer on | `rp doctor` → `$GITEA_TOKEN` |
 | **R1** clone / sparse | `git` | as above | `rp clone owner/repo` |
 | **T1** text index | Node ≥ 18 + context-mode | `npm install -g context-mode` (pi: `pi install npm:context-mode`) | `rp warm <repo>` |
 | **T2** code graph | graphicle | `curl -fsSL https://github.com/graphicle-ai/graphicle/releases/latest/download/install.sh \| sh`, then `graphicle doctor --fix` | `rp doctor` → `graphicle ok` |
@@ -56,6 +93,11 @@ without it `rp cache` still works, the store line just reads `?`.
 Environment overrides: `RP_LEDGER`, `RP_CACHE`, `RP_CACHE_GB`, `RP_FREE_FLOOR_GB`,
 `RP_BUDGET_MB`, `RP_SRC`, `RP_SKILLS`, `RP_AGENT_MD`, `RP_BIN`,
 `GRAPHICLE_DATA_DIR` (graphicle store), `CTX_MODE_CLI` (context-mode binary).
+
+Forge routing reads the same variables the forges' own CLIs read: `GH_HOST` (the
+default host for a bare `owner/repo`, and where `gh` looks for credentials),
+`GITLAB_TOKEN`, and `GITEA_TOKEN` / `FORGEJO_TOKEN`. `rp doctor` reports which of
+them are live.
 
 ## Agent integrations
 
@@ -102,6 +144,8 @@ pointer, and it names the shared library by path — they read `SKILL.md` and
 ```sh
 rp                      # tier of the repo I am standing in, plus the next command
 rp get owner/repo       # repo not on disk: remote commands, never a clone
+rp get gitlab.com/grp/sub/proj     # any forge: the host routes it
+rp get codeberg.org/forgejo/forgejo
 rp clone owner/repo src/sub
 rp warm .               # graphicle code graph: callers, impact, why
 rp docs .               # context-mode text index

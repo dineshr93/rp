@@ -116,6 +116,8 @@ esac
         Command::new(env!("CARGO_BIN_EXE_rp"))
             .args(args)
             .current_dir(&self.repo)
+            // HOME is redirected so agent_targets() can never reach the real box.
+            .env("HOME", &self.tmp)
             .env(
                 "PATH",
                 format!("{}:/usr/bin:/bin:/usr/local/bin", self.bin.display()),
@@ -152,6 +154,48 @@ esac
 
     fn touch_repo(&self) -> String {
         self.repo.canonicalize().unwrap().display().to_string()
+    }
+
+    fn seed_skill_src(&self) {
+        let d = self.tmp.join("src/skill");
+        fs::create_dir_all(&d).unwrap();
+        fs::copy(manifest_dir().join("skill/SKILL.md"), d.join("SKILL.md")).unwrap();
+        fs::copy(manifest_dir().join("skill/COSTS.md"), d.join("COSTS.md")).unwrap();
+    }
+
+    fn seed_agent_files(&self) {
+        for f in [
+            ".pi/agent/AGENTS.md",
+            ".claude/CLAUDE.md",
+            ".codex/AGENTS.md",
+            ".gemini/GEMINI.md",
+            ".copilot/instructions.md",
+            ".config/opencode/AGENTS.md",
+            ".hermes/AGENTS.md",
+        ] {
+            let p = self.tmp.join(f);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, format!("keep {f}\n")).unwrap();
+        }
+        // A Cursor rule we did not write: uninstall must leave it alone.
+        let c = self.tmp.join(".cursor/rules/repo-tiers.mdc");
+        fs::create_dir_all(c.parent().unwrap()).unwrap();
+        fs::write(&c, "foreign cursor rule\n").unwrap();
+    }
+
+    fn agent_files(&self) -> Vec<PathBuf> {
+        [
+            ".pi/agent/AGENTS.md",
+            ".claude/CLAUDE.md",
+            ".codex/AGENTS.md",
+            ".gemini/GEMINI.md",
+            ".copilot/instructions.md",
+            ".config/opencode/AGENTS.md",
+            ".hermes/AGENTS.md",
+        ]
+        .iter()
+        .map(|f| self.tmp.join(f))
+        .collect()
     }
 
     fn ledger_lines(&self) -> usize {
@@ -459,6 +503,93 @@ fn top_json_lists_visits() {
     let s = e.out(&["--json", "top", "5"]);
     let v = serde_like::parse(&s);
     assert!(v.get("repos").contains("visits"));
+}
+
+#[test]
+fn install_agents_all_reaches_every_memory_file() {
+    let e = Env::new("agentsall");
+    e.seed_skill_src();
+    e.seed_agent_files();
+    let o = e.cmd(&["install", "--agents", "all"]);
+    let s = stdout_of(&o);
+    assert!(o.status.success(), "{s}");
+    for p in e.agent_files() {
+        let t = fs::read_to_string(&p).unwrap();
+        assert!(
+            t.contains("repo-tiers:start"),
+            "{} lost the pointer",
+            p.display()
+        );
+        assert!(t.contains("keep "), "{} lost user prose", p.display());
+    }
+    // The foreign Cursor rule must be left exactly as it was.
+    let c = fs::read_to_string(e.tmp.join(".cursor/rules/repo-tiers.mdc")).unwrap();
+    assert_eq!(c, "foreign cursor rule\n");
+    assert!(s.contains("skipped"), "{s}");
+}
+
+#[test]
+fn install_creates_a_cursor_rule_when_none_exists() {
+    let e = Env::new("cursorrule");
+    e.seed_skill_src();
+    let o = e.cmd(&["install", "--agents", "cursor"]);
+    assert!(o.status.success(), "{}", stdout_of(&o));
+    let c = fs::read_to_string(e.tmp.join(".cursor/rules/repo-tiers.mdc")).unwrap();
+    assert!(
+        c.contains("alwaysApply: true") && c.contains("Repo tiers"),
+        "{c}"
+    );
+}
+
+#[test]
+fn uninstall_sweeps_every_agent_it_wrote() {
+    let e = Env::new("sweep");
+    e.seed_skill_src();
+    e.seed_agent_files();
+    e.cmd(&["install", "--agents", "all"]);
+    let o = e.cmd(&["uninstall"]);
+    assert!(o.status.success(), "{}", stdout_of(&o));
+    for p in e.agent_files() {
+        let t = fs::read_to_string(&p).unwrap();
+        assert!(
+            !t.contains("repo-tiers"),
+            "{} still carries a pointer:\n{t}",
+            p.display()
+        );
+        assert!(t.contains("keep "), "{} lost user prose", p.display());
+    }
+    let c = fs::read_to_string(e.tmp.join(".cursor/rules/repo-tiers.mdc")).unwrap();
+    assert_eq!(c, "foreign cursor rule\n", "foreign rule must survive");
+}
+
+#[test]
+fn unknown_agent_is_rejected() {
+    let e = Env::new("badagent");
+    let o = e.cmd(&["install", "--agents", "bogus"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("unknown agent"));
+}
+
+#[test]
+fn agents_json_lists_every_target() {
+    let e = Env::new("agentsjson");
+    let s = e.out(&["--json", "agents"]);
+    let v = serde_like::parse(&s);
+    for a in [
+        "pi", "claude", "codex", "gemini", "copilot", "cursor", "opencode", "hermes",
+    ] {
+        assert!(v.get("agents").contains(a), "missing {a} in {s}");
+    }
+}
+
+#[test]
+fn doctor_reports_which_tiers_are_live() {
+    let e = Env::new("tiers");
+    let s = e.out(&["--json", "doctor"]);
+    let v = serde_like::parse(&s);
+    assert!(v.get("tiers").contains("T0"), "{s}");
+    assert!(v.get("tiers").contains("R1"), "{s}");
+    assert!(v.get("tiers_missing").contains("needs"), "{s}");
 }
 
 #[test]

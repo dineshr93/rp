@@ -1,56 +1,60 @@
 # Changelog
 
-All notable changes to `rp` are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+All notable changes to `rp` are documented here.
 
-## [1.0.0] — 2026-10-16
-
-First production release. The tier model, the budget, and the install contract are
-considered stable.
+## [1.1.0] - 2026-10-15
 
 ### Added
-- **Tier routing** — `rp` reports the cheapest tier for reaching a repo and records
-  the visit: `R0` remote query, `R1` shallow/sparse clone, `T0` local grep,
-  `T1` context-mode text index, `T2` graphicle code graph.
-- **Visit ledger as the escalation signal** — a first-touch repo is told *do not
-  index*; the second visit flips it. The count decides, not the caller's judgement.
-- **Budget enforcement** — `RP_CACHE_GB` cap and `RP_FREE_FLOOR_GB` free-space
-  floor; `rp clone` checks free space and evicts before it downloads.
-- **LRU eviction with a dirty guard** — a clone holding uncommitted work is never
-  removed.
-- **`rp install` / `rp uninstall`** — idempotent bootstrap of binary, agent skill
-  and a marked `AGENTS.md` pointer block. Uninstall removes only its own block and
-  refuses a foreign skill directory.
-- **`rp doctor`** — 13 checks over toolchain, budgets and install state, each with
-  the fix on the next line. Exits 1 on a hard miss.
-- **`--json`** — machine-readable output for `state`, `get`, `top`, `cache`,
-  `doctor`, so an agent can branch on `tier` instead of parsing prose.
-- **`--quiet`** — suppresses progress chatter; errors still reach stderr.
-- **Input validation** — `owner/repo` slugs and sparse subpaths are validated, so
-  a malformed argument cannot write outside the clone cache.
-- **Error visibility** — swallowed I/O failures now count against the process and
-  exit non-zero; a printed line is no longer proof of success.
-- **`--version`**, documented exit codes (0 / 1 / 2), MIT license.
-- **Integration suite** — 21 tests that stub `git`, `gh`, `graphicle` and `node`
-  in a temp `PATH` and redirect every path rp touches, so the suite needs no
-  credentials and no network. 26 tests total with the unit tests.
-- **CI** — fmt, clippy `-D warnings`, build and test on Linux and macOS, an
-  install/uninstall smoke test, and a release binary artifact on tags.
+
+- `rp install --agents <a,b|all>` writes the tier pointer into each supported
+  agent's global memory file, so the rule is in force whichever agent opens the
+  next repo: pi, Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor
+  (written as an `alwaysApply` `.mdc` rule), OpenCode, Hermes.
+- `rp install --file <path>` for any other memory file; repeatable.
+- `rp agents` lists every target path with whether the file exists and whether rp's
+  pointer is in it; `rp agents --json` returns `{agent, memory_file, exists,
+  rp_installed}` per agent for scripts.
+- `rp doctor` reports `tiers live: R0 R1 T0 T1 T2` and, per missing tier, what
+  would unlock it. `--json` exposes `tiers` / `tiers_missing`.
+- README: **Dependencies** (per-tier install and verification commands) and
+  **Agent integrations** (the verified path map). Skill `COSTS.md` carries the
+  short version.
 
 ### Fixed
-- Date arithmetic in the ledger formatter used `era * 365` instead of `era * 400`,
-  printing 1851 for 2026 timestamps.
-- `gc` listed only ledger-known repos and hid projects synced before `rp` existed;
-  it now reads the graphicle store directly.
-- `top` labelled deleted clones as `cold`; they now read `gone`.
-- `rp | head` aborted on a closed stdout pipe; handled without a libc dependency.
-- JSON arrays double-escaped pre-built objects.
 
-### Known limits
-- No per-project delete exists in the graphicle CLI, so the graph store only grows.
-  `rp gc` documents the reclaim path; prevention (warm on repeat visits) is the
-  real lever.
-- `R0` assumes GitHub. Another forge needs its own remote tier.
+- `uninstall` resolved agent memory files from the real `$HOME` even when the rest
+  of the configuration was overridden, so the test suite swept the author's live
+  `~/.pi/agent/AGENTS.md` and removed its pointer block. Tests now redirect `HOME`
+  into the sandbox, and the new `uninstall_sweeps_every_agent_it_wrote` test pins
+  the behaviour: rp's blocks go, foreign prose and foreign Cursor rules stay.
 
-[1.0.0]: https://github.com/dineshr93/rp/releases/tag/v1.0.0
+## [1.0.0] - 2026-10-15
+
+### Added
+
+- Rust rewrite of the whole tool: zero crate dependencies, `#![deny(unsafe_code)]`,
+  `#![deny(clippy::all)]`, single 529 KB static binary.
+- Tier routing for reaching a git repo at the cheapest available cost:
+  `rp` (detect), `rp warm` (index), `rp docs` (graph), `rp top [N]`, `rp gc`,
+  `rp get owner/repo`, `rp clone owner/repo [subpath]`, `rp cache`, `rp evict`.
+- `rp install` / `rp uninstall` — idempotent bootstrap of binary, skill and the
+  marked `AGENTS.md` pointer block; uninstall refuses to remove a foreign skill dir.
+- `rp doctor` — toolchain, budget and install health with per-line fixes.
+- `--json` on `state`, `get`, `top`, `cache`, `doctor`; `--quiet` for scripts;
+  `--version`.
+- Input validation: repo slugs reject traversal and empty segments, subpaths reject
+  absolute paths, `..` and NUL bytes.
+- Error visibility: swallowed I/O failures now exit non-zero instead of reporting
+  success.
+- 26 tests (unit + hermetic integration with stubbed `git`/`gh`/`graphicle`/`node`),
+  CI for fmt, clippy, build and test on Linux and macOS, install/uninstall smoke
+  test, and release artifacts on version tags.
+- MIT license, this changelog, rewritten README.
+
+### Measured
+
+Costs behind the routing rules are recorded in `skill/COSTS.md`, measured on a
+2025 Ryzen AI 9 HX 370 with an NVMe drive: grep 0.02 s / 0 MB, context-mode index
+9.6 s / +153 MB per 746 files, graphicle sync 0.8 s / +9 MB at 362 files rising
+to 18.7 s / +746 MB at 12,191 files, and a full clone of a 12k-file repo at
+181 MB against 1.5 MB for the same repo sparse-checked-out to one subpath.

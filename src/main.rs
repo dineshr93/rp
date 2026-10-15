@@ -92,12 +92,15 @@ commands:\n\
   cache    clone cache: size, last touch, dirty flag\n\
   evict    LRU eviction; never removes a clone with uncommitted work\n\
   gc       graphicle store report and the reclaim path\n\
-  install  bootstrap this box: binary + skill + AGENTS.md pointer (idempotent)\n\
-  uninstall  undo install: pointer block + skill dir (--all also removes the binary)\n\
-  doctor   toolchain, budget and install health\n\
+  install  bootstrap this box: binary + skill + agent memory pointers (idempotent)\n\
+    --agents <a,b|all>   also write the pointer into each agent's global memory file\n\
+    --file <path>        extra memory file to write (repeatable)\n\
+  agents   list the supported agents, their memory files and install state\n\
+  uninstall  undo install: pointer blocks + skill dir (--all also removes the binary)\n\
+  doctor   toolchain, tier capability, budget and install health\n\
 \n\
 flags:\n\
-  -j, --json   machine-readable output (state, get, top, cache, doctor)\n\
+  -j, --json   machine-readable output (state, get, top, cache, doctor, agents)\n\"
   -q, --quiet  suppress progress chatter; errors still print\n\
   -V, --version  print version\n\
   -h, --help   this text\n\
@@ -870,17 +873,164 @@ const POINTER_START: &str =
     "<!-- repo-tiers:start (written by `rp install`; delete the block to opt out) -->";
 const POINTER_END: &str = "<!-- repo-tiers:end -->";
 
-/// The always-on pointer that lives in AGENTS.md. Everything else is behind it.
+/// The pointer text. Everything else is behind it.
+fn pointer_body(skills: &str) -> String {
+    "## Repo tiers — `rp` before you clone or index\n\
+\n\
+`rp` picks the cheapest tier for reaching a git repo: remote query, shallow or sparse clone, local grep, text index, code graph. Run `rp` in a repo, or `rp get owner/repo` for one not on disk, before cloning or indexing anything. Commands, measured costs and traps live in the `repo-tiers` skill at `SKILLS`. Bootstrap a fresh box with `cargo build --release && ./target/release/rp install`.\n\
+\n\
+Carry this one always: **local disk is a cache with a budget, not a library**, and cloning costs more than indexing."
+        .replace("SKILLS", skills)
+}
+
 fn pointer_block(skills: &str) -> String {
+    format!("{POINTER_START}\n{}\n{POINTER_END}", pointer_body(skills))
+}
+
+/// Global memory file each supported agent reads. Verified against this machine:
+/// every path below exists here except where noted, and each is the file that
+/// agent loads for all projects.
+struct AgentTarget {
+    name: &'static str,
+    path: PathBuf,
+    /// Cursor loads `.mdc` rule files with frontmatter instead of a plain memory file.
+    cursor_rule: bool,
+}
+
+fn agent_targets() -> Vec<AgentTarget> {
+    let home = svar("HOME", ".");
+    let t = |name: &'static str, rel: String, cursor_rule: bool| AgentTarget {
+        name,
+        path: PathBuf::from(rel),
+        cursor_rule,
+    };
+    vec![
+        t("pi", format!("{home}/.pi/agent/AGENTS.md"), false),
+        t("claude", format!("{home}/.claude/CLAUDE.md"), false),
+        t("codex", format!("{home}/.codex/AGENTS.md"), false),
+        t("gemini", format!("{home}/.gemini/GEMINI.md"), false),
+        t("copilot", format!("{home}/.copilot/instructions.md"), false),
+        t(
+            "cursor",
+            format!("{home}/.cursor/rules/repo-tiers.mdc"),
+            true,
+        ),
+        t(
+            "opencode",
+            format!("{home}/.config/opencode/AGENTS.md"),
+            false,
+        ),
+        t("hermes", format!("{home}/.hermes/AGENTS.md"), false),
+    ]
+}
+
+fn cursor_rule_text(skills: &str) -> String {
     format!(
-        "{POINTER_START}\n\
-## Repo tiers — `rp` before you clone or index\n\
-\n\
-`rp` picks the cheapest tier for reaching a git repo: remote query, shallow or sparse clone, local grep, text index, code graph. Run `rp` in a repo, or `rp get owner/repo` for one not on disk, before cloning or indexing anything. Commands, measured costs and traps live in the `repo-tiers` skill at `{skills}`. Bootstrap a fresh box with `cargo build --release && ./target/release/rp install`.\n\
-\n\
-Carry this one always: **local disk is a cache with a budget, not a library**, and cloning costs more than indexing.\n\
-{POINTER_END}"
+        "---\ndescription: Repo tiers - the cheapest way to reach a git repo\nalwaysApply: true\n---\n{}\n",
+        pointer_body(skills)
     )
+}
+
+/// Write the pointer into one agent's memory file. Marker-guarded for plain files;
+/// a Cursor rule we own is rewritten whole, a foreign one is left alone.
+fn install_target(path: &Path, cursor_rule: bool, skills: &str) -> &'static str {
+    if let Some(p) = path.parent() {
+        if let Err(e) = fs::create_dir_all(p) {
+            warn_io("cannot create agent dir", &e);
+            return "FAILED";
+        }
+    }
+    let cur = fs::read_to_string(path).unwrap_or_default();
+    if cursor_rule {
+        if cur.contains("Repo tiers") {
+            let want = cursor_rule_text(skills);
+            if cur == want {
+                return "unchanged";
+            }
+            return match fs::write(path, want) {
+                Ok(()) => "updated",
+                Err(e) => {
+                    warn_io("cursor rule write", &e);
+                    "FAILED"
+                }
+            };
+        }
+        if !cur.trim().is_empty() {
+            return "skipped (foreign rule file)";
+        }
+        return match fs::write(path, cursor_rule_text(skills)) {
+            Ok(()) => "created",
+            Err(e) => {
+                warn_io("cursor rule write", &e);
+                "FAILED"
+            }
+        };
+    }
+    upsert_pointer(path, &pointer_block(skills))
+}
+
+fn target_ours(path: &Path, cursor_rule: bool) -> bool {
+    let cur = fs::read_to_string(path).unwrap_or_default();
+    if cursor_rule {
+        cur.contains("Repo tiers")
+    } else {
+        cur.contains(POINTER_START)
+    }
+}
+
+fn resolve_agents(spec: &str) -> Result<Vec<String>, String> {
+    let all: Vec<String> = agent_targets().iter().map(|t| t.name.to_string()).collect();
+    if spec.eq_ignore_ascii_case("all") {
+        return Ok(all);
+    }
+    let mut out = Vec::new();
+    for raw in spec.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if !all.iter().any(|n| n.eq_ignore_ascii_case(raw)) {
+            return Err(format!("unknown agent '{raw}' (known: {})", all.join(", ")));
+        }
+        out.push(raw.to_lowercase());
+    }
+    Ok(out)
+}
+
+fn cmd_agents(c: &Cfg) {
+    let skills = c.skills.display().to_string();
+    if json_on() {
+        let items: Vec<String> = agent_targets()
+            .iter()
+            .map(|t| {
+                format!(
+                    "{{\"agent\":{},\"memory_file\":{},\"exists\":{},\"rp_installed\":{}}}",
+                    jstr(t.name),
+                    jstr(&t.path.display().to_string()),
+                    t.path.exists(),
+                    target_ours(&t.path, t.cursor_rule)
+                )
+            })
+            .collect();
+        println!(
+            "{{\"agents\":{},\"skill_dir\":{}}}",
+            jarr_raw(&items),
+            jstr(&skills)
+        );
+        return;
+    }
+    println!("agent memory files rp can write:\n");
+    for t in agent_targets() {
+        let here = if t.path.exists() {
+            "file present"
+        } else {
+            "no file yet"
+        };
+        let ours = if target_ours(&t.path, t.cursor_rule) {
+            "rp pointer: yes"
+        } else {
+            "rp pointer: no"
+        };
+        println!("  {:<10} {}", t.name, t.path.display());
+        println!("  {:<10} {here} · {ours}", "");
+    }
+    println!("\nwrite them with: rp install --agents all   (or a comma list)");
 }
 
 /// Replace the marked block, insert it before `## Shell`, or append. Never touches
@@ -916,7 +1066,7 @@ fn upsert_pointer(md: &Path, block: &str) -> &'static str {
     }
 }
 
-fn cmd_install(c: &Cfg) {
+fn cmd_install(c: &Cfg, agents: &[String], files: &[String]) {
     let skill_src = c.src.join("skill");
     if !skill_src.join("SKILL.md").exists() {
         eprintln!(
@@ -946,11 +1096,37 @@ fn cmd_install(c: &Cfg) {
             to.display()
         );
     }
-    println!(
-        "  {:<10} {}",
-        upsert_pointer(&c.agent_md, &pointer_block(&c.skills.display().to_string())),
-        c.agent_md.display()
-    );
+    let skills = c.skills.display().to_string();
+    if agents.is_empty() && files.is_empty() {
+        println!(
+            "  {:<10} {}",
+            upsert_pointer(&c.agent_md, &pointer_block(&skills)),
+            c.agent_md.display()
+        );
+    } else {
+        for want in agents {
+            match agent_targets().into_iter().find(|t| t.name == *want) {
+                Some(t) => println!(
+                    "  {:<10} {}  [{}]",
+                    install_target(&t.path, t.cursor_rule, &skills),
+                    t.path.display(),
+                    t.name
+                ),
+                None => {
+                    eprintln!("rp: unknown agent {want}");
+                    exit(2);
+                }
+            }
+        }
+        for f in files {
+            let p = PathBuf::from(f);
+            println!(
+                "  {:<10} {}",
+                upsert_pointer(&p, &pointer_block(&skills)),
+                p.display()
+            );
+        }
+    }
     // Self-install only when launched from a build tree, so the installed binary
     // re-run never tries to overwrite the file it is running from.
     if let Ok(exe) = env::current_exe() {
@@ -1002,13 +1178,33 @@ fn remove_pointer(md: &Path) -> &'static str {
     "removed"
 }
 
-/// Undo `install`. The skill dir is only removed if it really is the repo-tiers skill.
+/// Undo `install`. Sweeps every agent memory file, but removes only what rp wrote:
+/// its own marker block in plain files, its own Cursor rule, its own skill dir.
 fn cmd_uninstall(c: &Cfg, all: bool) {
     println!(
         "  {:<10} {}",
         remove_pointer(&c.agent_md),
         c.agent_md.display()
     );
+    for t in agent_targets() {
+        if t.path == c.agent_md || !target_ours(&t.path, t.cursor_rule) {
+            continue;
+        }
+        if t.cursor_rule {
+            if let Err(e) = fs::remove_file(&t.path) {
+                warn_io("cursor rule removal", &e);
+            } else {
+                println!("  {:<10} {}  [{}]", "removed", t.path.display(), t.name);
+            }
+        } else {
+            println!(
+                "  {:<10} {}  [{}]",
+                remove_pointer(&t.path),
+                t.path.display(),
+                t.name
+            );
+        }
+    }
     let sk = c.skills.join("SKILL.md");
     if sk.exists() {
         let ours = fs::read_to_string(&sk)
@@ -1071,6 +1267,51 @@ fn push_row(
         "miss"
     };
     rows.push((name, st, first_line(out), fix));
+}
+
+fn status_of(rows: &[(&'static str, &'static str, String, &'static str)], name: &str) -> bool {
+    rows.iter().any(|r| r.0 == name && r.1 == "ok")
+}
+
+/// Which tiers this box can actually serve, given what is installed.
+fn live_tiers(rows: &[(&'static str, &'static str, String, &'static str)]) -> Vec<&'static str> {
+    let mut v = vec!["T0"];
+    if status_of(rows, "gh cli") && status_of(rows, "gh auth") {
+        v.push("R0");
+    }
+    if status_of(rows, "git") {
+        v.push("R1");
+    }
+    if status_of(rows, "node") && status_of(rows, "context-mode cli") {
+        v.push("T1");
+    }
+    if status_of(rows, "graphicle") {
+        v.push("T2");
+    }
+    v.sort_unstable();
+    v
+}
+
+fn missing_tiers(
+    rows: &[(&'static str, &'static str, String, &'static str)],
+) -> Vec<(&'static str, &'static str)> {
+    let mut m = Vec::new();
+    if !(status_of(rows, "gh cli") && status_of(rows, "gh auth")) {
+        m.push(("R0", "install gh, then run: gh auth login"));
+    }
+    if !status_of(rows, "git") {
+        m.push(("R1", "install git"));
+    }
+    if !(status_of(rows, "node") && status_of(rows, "context-mode cli")) {
+        m.push(("T1", "install node, then: npm install -g context-mode"));
+    }
+    if !status_of(rows, "graphicle") {
+        m.push((
+            "T2",
+            "install graphicle (see README: Dependencies) or set GRAPHICLE_DATA_DIR",
+        ));
+    }
+    m
 }
 
 fn cmd_doctor(c: &Cfg) {
@@ -1193,6 +1434,9 @@ fn cmd_doctor(c: &Cfg) {
         "",
     ));
 
+    let live = live_tiers(&rows);
+    let missing = missing_tiers(&rows);
+
     let mut miss = 0;
     let mut warn = 0;
     if json_on() {
@@ -1208,14 +1452,20 @@ fn cmd_doctor(c: &Cfg) {
                 )
             })
             .collect();
+        let gaps: Vec<String> = missing
+            .iter()
+            .map(|(t, why)| format!("{{\"tier\":{},\"needs\":{}}}", jstr(t), jstr(why)))
+            .collect();
         let jmiss = rows.iter().filter(|r| r.1 == "miss").count();
         let jwarn = rows.iter().filter(|r| r.1 == "warn").count();
         println!(
-            "{{\"checks\":{},\"ok\":{},\"warn\":{},\"miss\":{}}}",
+            "{{\"checks\":{},\"ok\":{},\"warn\":{},\"miss\":{},\"tiers\":{},\"tiers_missing\":{}}}",
             jarr_raw(&items),
             rows.len() - jmiss - jwarn,
             jwarn,
-            jmiss
+            jmiss,
+            jarr(&live.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+            jarr_raw(&gaps)
         );
         if jmiss > 0 {
             exit(1);
@@ -1239,6 +1489,14 @@ fn cmd_doctor(c: &Cfg) {
             println!("       → {fix}");
         }
     }
+    println!("\ntiers live: {}", live.join(" "));
+    if missing.is_empty() {
+        println!("  every tier rp knows is available on this box");
+    } else {
+        for (t, why) in &missing {
+            println!("  {t} unavailable → {why}");
+        }
+    }
     println!(
         "\n{} ok · {warn} warn · {miss} miss",
         rows.len() - warn - miss
@@ -1260,10 +1518,14 @@ fn main() {
         exit(1);
     }));
 
+    let raw: Vec<String> = env::args().skip(1).collect();
     let mut args: Vec<String> = Vec::new();
     let mut all = false;
-    for a in env::args().skip(1) {
-        match a.as_str() {
+    let mut agents: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < raw.len() {
+        match raw[i].as_str() {
             "-j" | "--json" => JSON.store(true, Ordering::Relaxed),
             "-q" | "--quiet" => QUIET.store(true, Ordering::Relaxed),
             "-V" | "--version" => {
@@ -1275,8 +1537,25 @@ fn main() {
                 return;
             }
             "--all" => all = true,
-            _ => args.push(a),
+            "--agents" => {
+                let v = raw.get(i + 1).cloned().unwrap_or_default();
+                if v.is_empty() {
+                    die_input("--agents needs a comma list (pi,claude,...) or 'all'");
+                }
+                agents = resolve_agents(&v).unwrap_or_else(|e| die_input(&e));
+                i += 1;
+            }
+            "--file" => {
+                let v = raw.get(i + 1).cloned().unwrap_or_default();
+                if v.is_empty() {
+                    die_input("--file needs a path to an agent memory file");
+                }
+                files.push(v);
+                i += 1;
+            }
+            other => args.push(other.to_string()),
         }
+        i += 1;
     }
     let c = Cfg::new();
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("state");
@@ -1305,7 +1584,8 @@ fn main() {
         },
         "cache" => cmd_cache(&c),
         "evict" => evict(&c),
-        "install" => cmd_install(&c),
+        "install" => cmd_install(&c, &agents, &files),
+        "agents" => cmd_agents(&c),
         "uninstall" => cmd_uninstall(&c, all),
         "doctor" => cmd_doctor(&c),
         "-h" | "--help" | "help" => println!("{USAGE}"),

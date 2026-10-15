@@ -33,9 +33,64 @@ cargo build --release && ./target/release/rp install && rp doctor
 `~/.pi/agent/AGENTS.md`. It is idempotent and only ever touches its own block, so
 hand-edited notes survive. `rp uninstall` reverses it.
 
-Requires: `git`. Optional: `gh` (remote tier), `graphicle` (graph tier),
-`node` + context-mode (text tier), `python3` (store reporting). Missing pieces
-degrade the tiers; `rp doctor` tells you which.
+## Dependencies
+
+`rp` itself needs a shell, `git` and coreutils. Everything else buys a tier:
+
+| tier | needs | install | check |
+|---|---|---|---|
+| **T0** grep, ledger, budget | `git` | any package manager | `rp state` |
+| **R0** remote query | `gh`, authenticated | `apt install gh` / `brew install gh`, then `gh auth login` (token needs `repo` scope) | `rp doctor` → `gh auth  ok` |
+| **R1** clone / sparse | `git` | as above | `rp clone owner/repo` |
+| **T1** text index | Node ≥ 18 + context-mode | `npm install -g context-mode` (pi: `pi install npm:context-mode`) | `rp warm <repo>` |
+| **T2** code graph | graphicle | `curl -fsSL https://github.com/graphicle-ai/graphicle/releases/latest/download/install.sh \| sh`, then `graphicle doctor --fix` | `rp doctor` → `graphicle ok` |
+| build only | stable Rust, 2024 edition | `curl https://sh.rustup.rs -sh` | `cargo build --release` |
+
+A missing dependency is never fatal: `rp doctor` prints which tiers are live and
+what would unlock the rest, and `rp` will not route into a tier it cannot serve.
+`rp doctor --json` carries the same as `tiers` / `tiers_missing`.
+
+`python3` is optional and only used to read the graphicle store for size reporting;
+without it `rp cache` still works, the store line just reads `?`.
+
+Environment overrides: `RP_LEDGER`, `RP_CACHE`, `RP_CACHE_GB`, `RP_FREE_FLOOR_GB`,
+`RP_BUDGET_MB`, `RP_SRC`, `RP_SKILLS`, `RP_AGENT_MD`, `RP_BIN`,
+`GRAPHICLE_DATA_DIR` (graphicle store), `CTX_MODE_CLI` (context-mode binary).
+
+## Agent integrations
+
+`rp install --agents` writes the same pointer into each agent's global memory file,
+so the tier rule is in force whichever agent you open the next repo with. Paths
+verified on a live box:
+
+| agent | file written |
+|---|---|
+| pi | `~/.pi/agent/AGENTS.md` |
+| Claude Code | `~/.claude/CLAUDE.md` |
+| Codex CLI | `~/.codex/AGENTS.md` |
+| Gemini CLI | `~/.gemini/GEMINI.md` |
+| GitHub Copilot CLI | `~/.copilot/instructions.md` |
+| Cursor | `~/.cursor/rules/repo-tiers.mdc` (an `alwaysApply` rule) |
+| OpenCode | `~/.config/opencode/AGENTS.md` |
+| Hermes | `~/.hermes/AGENTS.md` |
+
+```bash
+rp agents                               # what exists, and which files already carry the pointer
+rp install --agents all                 # write every one of them
+rp install --agents pi,claude,hermes    # or a subset
+rp install --file ~/team/MEMORY.md      # plus any other memory file (repeatable)
+rp uninstall                            # sweeps every file it wrote
+```
+
+Nothing outside the markers is touched. Plain memory files get the block between
+`<!-- repo-tiers:start -->` and `<!-- repo-tiers:end -->`; your own prose survives
+install and uninstall either way. A Cursor rule rp did not write is reported as
+`skipped (foreign rule file)` and left byte for byte. `rp agents --json` returns
+`{agent, memory_file, exists, rp_installed}` per agent for scripts.
+
+Agents with no skill loader of their own (Copilot CLI, Gemini CLI) still get the
+pointer, and it names the skill directory by path — they read `SKILL.md` and
+`COSTS.md` from there the same way pi does.
 
 ## Use
 

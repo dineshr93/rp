@@ -93,3 +93,24 @@ Everything is env-overridable, so nothing is hardcoded to this machine:
 | `RP_BIN` | `~/.local/bin/rp` | binary install target |
 | `GRAPHICLE_DATA_DIR` | `~/.local/share/graphicle` | graphicle store |
 | `CTX_MODE_CLI` | `~/.pi/agent/npm/node_modules/context-mode/cli.bundle.mjs` | context-mode CLI |
+
+## Dependencies per tier
+
+| tier | needs | unlock |
+|---|---|---|
+| T0 | `git` | always available |
+| R0 | `gh` + `gh auth login` (`repo` scope) | remote query without cloning |
+| R1 | `git` | clone / sparse |
+| T1 | node ≥ 18 + `context-mode` | text index |
+| T2 | `graphicle` | code graph |
+
+`rp doctor` prints `tiers live: ...` and what is missing for the rest; `rp` will not
+route into a tier it cannot serve. Full install commands are in the project README.
+
+## Installing the rule for other agents
+
+`rp install --agents all` writes the pointer into every supported agent's global
+memory file — pi, Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor,
+OpenCode, Hermes. `rp agents` (or `rp agents --json`) is the live list of paths and
+their state. Marker-guarded: your own prose survives install and uninstall, and a
+Cursor rule rp did not write is reported `skipped (foreign rule file)` and left alone.

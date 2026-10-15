@@ -24,6 +24,12 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # An unquoted ": " inside a frontmatter value makes YAML see a nested mapping and
+      # the agent harness refuses to load the skill. Catch it here, not in the TUI.
+      - name: skill frontmatter parses as YAML
+        run: |
+          python3 -c "import yaml" 2>/dev/null || pip install pyyaml
+          python3 -c "import yaml; yaml.safe_load(open('skill/SKILL.md').read().split('---')[1])"
 
   test:
     name: build + test (${{ matrix.os }})

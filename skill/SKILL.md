@@ -1,6 +1,6 @@
 ---
 name: repo-tiers
-description: Repo tiers - the cheapest way to reach a git repo: remote query, shallow or sparse clone, local grep, text index, or code graph. Use when a repo is not on disk, before cloning, before indexing with graphicle or context-mode, when entering an unfamiliar repo, or when disk or context is tight.
+description: "Repo tiers - the cheapest way to reach a git repo: remote query, shallow or sparse clone, local grep, text index, or code graph. Use when a repo is not on disk, before cloning, before indexing with graphicle or context-mode, when entering an unfamiliar repo, or when disk or context is tight."
 ---
 
 # Repo tiers
